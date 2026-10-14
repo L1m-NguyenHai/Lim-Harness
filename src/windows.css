@@ -1,0 +1,25 @@
+.floating-window { position: fixed; display: flex; flex-direction: column; min-width: 0; overflow: hidden; border: 1px solid var(--composer-border); border-radius: 10px; background: var(--background); box-shadow: 0 20px 65px #0004, 0 3px 10px #0002; }
+.floating-window[hidden] { display: none; }
+.floating-window:focus { outline: none; }
+.floating-window:focus-visible { outline: 2px solid var(--focus); }
+.floating-window.is-maximized { inset: 8px 8px 44px; }
+.window-titlebar { display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; height: 44px; padding: 0 10px 0 16px; background: var(--surface); border-bottom: 1px solid var(--border); cursor: grab; touch-action: none; user-select: none; }
+.window-titlebar:active { cursor: grabbing; }
+.window-titlebar h2 { font-size: 15px; font-weight: 600; color: var(--accent); }
+.window-actions { display: flex; gap: 3px; }
+.window-placement summary { display: grid; place-items: center; width: 28px; height: 28px; cursor: pointer; border-radius: 5px; list-style: none; color: var(--muted); }
+.window-placement summary::-webkit-details-marker { display: none; }
+.window-placement summary:focus-visible { outline: 2px solid var(--focus); }
+.window-placement > div { position: absolute; top: 40px; right: 12px; z-index: 2; width: 150px; display: flex; flex-direction: column; padding: 5px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 5px 20px #0003; }
+.window-placement > div button { text-align: left; padding: 6px 9px; font-size: 12px; border-radius: 4px; }
+.window-actions .icon-button { width: 28px; height: 28px; border-radius: 5px; color: var(--muted); }
+.window-actions button:last-child:hover { color: var(--accent); background: var(--accent-soft); }
+.window-body { min-height: 0; flex: 1; overflow: auto; padding: 20px; overscroll-behavior: contain; }
+.window-body-cookbook { padding: 0; }
+.window-body .page-heading h1 { font-size: 21px; }
+.window-resizer { position: absolute; width: 18px; height: 18px; right: 2px; bottom: 2px; cursor: nwse-resize; touch-action: none; border-radius: 2px; background: repeating-linear-gradient(135deg, transparent 0 4px, var(--muted) 4px 5px, transparent 5px 8px); clip-path: polygon(100% 0,100% 100%,0 100%); opacity: .65; }
+.window-dock { position: fixed; z-index: 2000; bottom: 8px; left: 50%; transform: translateX(-50%); display: flex; gap: 5px; max-width: calc(100vw - 20px); overflow: auto; padding: 4px; border: 1px solid var(--border); background: var(--surface); border-radius: 8px; box-shadow: 0 4px 16px #0002; }
+.window-dock button { display: flex; gap: 7px; align-items: center; padding: 5px 10px; font-size: 12px; border-radius: 5px; white-space: nowrap; }
+.window-dock button::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: var(--accent); }
+.toast { z-index: 2200; }
+@media (max-width: 700px) { .window-body { padding: 14px; } .window-body-cookbook { padding: 0; } .window-titlebar { padding-left: 12px; } }

@@ -1,0 +1,26 @@
+node_modules/
+dist/
+src-tauri/target/
+*.local
+.env
+.env.*
+!.env.example
+odysseus/
+.agents/
+artifacts/
+# Generated Tauri schemas and local machine/runtime data
+src-tauri/gen/
+.vs/
+*.log
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.gguf
+*.safetensors
+# Machine-specific configs, vaults and unsynchronized project notes
+.codex/
+vault/
+vaults/
+models/
+docs/notion-pending.md

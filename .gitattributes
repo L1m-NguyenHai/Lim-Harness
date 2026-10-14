@@ -1,0 +1,12 @@
+# Keep diffs stable between Windows and other contributors.
+* text=auto
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.sh text eol=lf
+*.rs text eol=lf
+*.tsx text eol=lf
+*.ts text eol=lf
+*.css text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+Cargo.lock text eol=lf
