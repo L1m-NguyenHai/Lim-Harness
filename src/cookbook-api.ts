@@ -19,6 +19,7 @@ export type SetupEvent = {
 export const cookbook = {
   snapshot: () => invoke<CookbookSnapshot>("cookbook_snapshot"),
   catalog: (refresh = false) => invoke<CatalogSnapshot>("get_model_catalog", { refresh }),
+  search: (query: string, provider: "all" | "ollama" | "huggingface") => invoke<CatalogSnapshot>("search_model_catalog", { query, provider }),
   setup: (model: string, contextSize: number, receive: (event: SetupEvent) => void) => {
     const onEvent = new Channel<SetupEvent>();
     onEvent.onmessage = receive;

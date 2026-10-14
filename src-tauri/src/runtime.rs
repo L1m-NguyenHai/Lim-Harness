@@ -15,7 +15,27 @@ use uuid::Uuid;
 
 const OLLAMA: &str = "http://127.0.0.1:11434";
 fn input_budget(context_size: usize, settings: &InferenceSettings) -> usize {
-    context_size.saturating_sub(settings.num_predict + settings.system_prompt.len() + 256)
+    context_size.saturating_sub(settings.output_reserve() + settings.system_prompt.len() + 256)
+}
+/// Streamed chunk counts per phase. Ollama streams about one token per chunk, so these are
+/// live estimates; the final Ollama eval_count stays the authoritative total.
+pub(crate) struct Counts {
+    thinking: u64,
+    answer: u64,
+    think_budget: u64,
+    answer_budget: u64,
+    thinking_capped: bool,
+}
+impl Counts {
+    fn usage(&self) -> Value {
+        json!({"type":"usage","usage":{"thinkingTokens":self.thinking,"answerTokens":self.answer,"thinkingBudget":self.think_budget,"answerBudget":self.answer_budget,"thinkingCapped":self.thinking_capped}})
+    }
+}
+enum Step {
+    Continue,
+    Done,
+    /// Ollama stopped at num_predict (done_reason "length").
+    Length,
 }
 struct ActiveRun {
     id: String,
@@ -66,6 +86,23 @@ pub fn get_snapshot(state: State<'_, Arc<Runtime>>) -> Result<Snapshot, String> 
 #[tauri::command]
 pub fn create_session(state: State<'_, Arc<Runtime>>) -> Result<Session, String> {
     state.store.create_session()
+}
+#[tauri::command]
+pub fn set_session_config(
+    state: State<'_, Arc<Runtime>>,
+    session_id: String,
+    config: crate::storage::SessionConfig,
+) -> Result<(), String> {
+    state.store.set_session_config(&session_id, &config)
+}
+#[tauri::command]
+pub fn delete_session(state: State<'_, Arc<Runtime>>, session_id: String) -> Result<(), String> {
+    // Holding the active-run lock keeps a new turn from starting while the rows are removed.
+    let active = state.active.lock().map_err(|_| "Runtime không khả dụng")?;
+    if active.contains_key(&session_id) {
+        return Err("Phiên đang có lượt chạy; dừng trả lời trước khi xoá.".into());
+    }
+    state.store.delete_session(&session_id)
 }
 #[tauri::command]
 pub fn import_sessions(
@@ -161,7 +198,7 @@ pub fn start_turn(
         })?;
     let text = text.trim().to_string();
     let model = model.trim().to_string();
-    let (context_size, settings) = state.store.inference_config()?;
+    let (context_size, settings) = state.store.session_config(&session_id)?;
     let maximum = input_budget(context_size, &settings)
         .saturating_sub(32)
         .min(8_000);
@@ -385,19 +422,92 @@ async fn generate(
         return Err("Không thể giữ nguyên tin nhắn mới nhất trong context; lượt đã dừng.".into());
     }
     history.extend(transcript);
-    let mut options = json!({"num_ctx":context_size,"num_predict":settings.num_predict,"temperature":settings.temperature,"top_p":settings.top_p,"top_k":settings.top_k,"repeat_penalty":settings.repeat_penalty});
+    let mut options = json!({"num_ctx":context_size,"temperature":settings.temperature,"top_p":settings.top_p,"top_k":settings.top_k,"repeat_penalty":settings.repeat_penalty});
     if let Some(seed) = settings.seed {
         options["seed"] = json!(seed);
     }
+    let thinking_on = settings.think_predict > 0;
+    let mut counts = Counts {
+        thinking: 0,
+        answer: 0,
+        think_budget: settings.think_predict as u64,
+        answer_budget: settings.num_predict as u64,
+        thinking_capped: false,
+    };
+    // Separate budgets with Ollama's exact token counting:
+    // phase 1 stops at exactly think_predict generated tokens (thinking plus any answer start);
+    // if cut there, phase 2 runs with thinking off and its own answer budget.
+    options["num_predict"] = json!(if thinking_on { settings.think_predict } else { settings.num_predict });
     let mut request = json!({"model":model,"messages":history,"stream":true,"options":options});
-    // Qwen3's thinking can exhaust this small output budget before any answer text.
-    if model == "qwen3" || model.starts_with("qwen3:") {
+    if !thinking_on {
         request["think"] = json!(false);
     }
+    let _ = emit(channel, run, session, sequence, counts.usage());
+    let mut step = stream_chat(runtime, &request, assistant, channel, run, session, sequence, content, thinking, metrics, model, context_size, &mut counts).await?;
+    if thinking_on && matches!(step, Step::Length) {
+        let phase_one = metrics.as_ref().and_then(|m| m.output_tokens).unwrap_or(0);
+        let answer_started = !content.trim().is_empty();
+        counts.thinking_capped = !answer_started;
+        let _ = emit(channel, run, session, sequence, counts.usage());
+        // Pass the reasoning so far; it fits in the space reserved for thinking.
+        let note = if answer_started {
+            format!("Ghi chú suy nghĩ của trợ lý cho câu hỏi cuối:\n{}", thinking.trim())
+        } else {
+            format!("Ghi chú suy nghĩ nháp của trợ lý cho câu hỏi cuối (đã dừng vì đạt giới hạn {} token suy nghĩ). Dùng nếu hữu ích, rồi trả lời trực tiếp:\n{}", settings.think_predict, thinking.trim())
+        };
+        let mut messages = history.clone();
+        match messages.first_mut() {
+            Some(first) if first["role"] == "system" => {
+                let merged = format!("{}\n\n{note}", first["content"].as_str().unwrap_or_default());
+                first["content"] = json!(merged);
+            }
+            _ => messages.insert(0, json!({"role":"system","content":note})),
+        }
+        // Answer already started: prefill it so Ollama continues the same assistant message.
+        if answer_started {
+            messages.push(json!({"role":"assistant","content":content.clone()}));
+        }
+        let remaining = (settings.num_predict as u64).saturating_sub(counts.answer).max(16);
+        let mut retry = request.clone();
+        retry["messages"] = json!(messages);
+        retry["think"] = json!(false);
+        retry["options"]["num_predict"] = json!(remaining);
+        step = stream_chat(runtime, &retry, assistant, channel, run, session, sequence, content, thinking, metrics, model, context_size, &mut counts).await?;
+        // eval_count of the retry covers only phase 2; report the whole run.
+        if let Some(m) = metrics.as_mut() {
+            m.output_tokens = Some(m.output_tokens.unwrap_or(0) + phase_one);
+            m.thinking_capped = counts.thinking_capped;
+            if let Ok(raw) = serde_json::to_value(&*m) {
+                let _ = emit(channel, run, session, sequence, json!({"type":"metrics","metrics":raw}));
+            }
+        }
+    }
+    let _ = emit(channel, run, session, sequence, counts.usage());
+    match step {
+        Step::Length => Err(format!("Câu trả lời đạt giới hạn {} token trả lời (suy nghĩ tính riêng). Phần đã nhận được giữ lại; tăng giới hạn trả lời hoặc yêu cầu trả lời ngắn hơn.", settings.num_predict)),
+        _ => completed(content),
+    }
+}
+#[allow(clippy::too_many_arguments)]
+async fn stream_chat(
+    runtime: &Runtime,
+    request: &Value,
+    assistant: &mut Message,
+    channel: &Channel<Value>,
+    run: &str,
+    session: &str,
+    sequence: &mut u64,
+    content: &mut String,
+    thinking: &mut String,
+    metrics: &mut Option<crate::storage::ChatMetrics>,
+    model: &str,
+    context_size: usize,
+    counts: &mut Counts,
+) -> Result<Step, String> {
     let response = runtime
         .client
         .post(format!("{OLLAMA}/api/chat"))
-        .json(&request)
+        .json(request)
         .send()
         .await
         .map_err(|_| {
@@ -409,6 +519,7 @@ async fn generate(
             response.status()
         ));
     }
+    // Dropping the response on an early return closes the connection, which stops Ollama.
     let mut stream = response.bytes_stream();
     let mut pending = Vec::new();
     loop {
@@ -423,22 +534,9 @@ async fn generate(
                 }
                 while let Some(end) = pending.iter().position(|b| *b == b'\n') {
                     let line: Vec<u8> = pending.drain(..=end).collect();
-                    if consume(
-                        &line,
-                        runtime,
-                        assistant,
-                        channel,
-                        run,
-                        session,
-                        sequence,
-                        content,
-                        thinking,
-                        metrics,
-                        model,
-                        context_size,
-                        settings.num_predict,
-                    )? {
-                        return completed(content);
+                    match consume(&line, runtime, assistant, channel, run, session, sequence, content, thinking, metrics, model, context_size, counts)? {
+                        Step::Continue => {}
+                        step => return Ok(step),
                     }
                 }
             }
@@ -446,24 +544,11 @@ async fn generate(
                 return Err("Kết nối Ollama bị gián đoạn; phần đã nhận được giữ lại.".into())
             }
             None => {
-                if !pending.is_empty()
-                    && consume(
-                        &pending,
-                        runtime,
-                        assistant,
-                        channel,
-                        run,
-                        session,
-                        sequence,
-                        content,
-                        thinking,
-                        metrics,
-                        model,
-                        context_size,
-                        settings.num_predict,
-                    )?
-                {
-                    return completed(content);
+                if !pending.is_empty() {
+                    match consume(&pending, runtime, assistant, channel, run, session, sequence, content, thinking, metrics, model, context_size, counts)? {
+                        Step::Continue => {}
+                        step => return Ok(step),
+                    }
                 }
                 return Err("Ollama đóng stream trước tín hiệu hoàn tất.".into());
             }
@@ -490,10 +575,10 @@ fn consume(
     metrics: &mut Option<crate::storage::ChatMetrics>,
     model: &str,
     context_size: usize,
-    num_predict: usize,
-) -> Result<bool, String> {
+    counts: &mut Counts,
+) -> Result<Step, String> {
     if line.iter().all(u8::is_ascii_whitespace) {
-        return Ok(false);
+        return Ok(Step::Continue);
     }
     let frame: Value =
         serde_json::from_slice(line).map_err(|_| "Ollama trả khung JSON không hợp lệ")?;
@@ -543,6 +628,10 @@ fn consume(
             sequence,
             json!({"type":"thinking_delta","delta":thought}),
         )?;
+        counts.thinking += 1;
+        if counts.thinking.is_multiple_of(16) {
+            let _ = emit(channel, run, session, sequence, counts.usage());
+        }
     }
     if let Some(delta) = frame["message"]["content"].as_str() {
         if !delta.is_empty() {
@@ -558,12 +647,14 @@ fn consume(
                 sequence,
                 json!({"type":"text_delta","delta":delta}),
             )?;
+            counts.answer += 1;
+            if counts.answer.is_multiple_of(16) {
+                let _ = emit(channel, run, session, sequence, counts.usage());
+            }
         }
     }
     let done = frame.get("done").and_then(Value::as_bool) == Some(true);
-    if done && frame.get("done_reason").and_then(Value::as_str) == Some("length") {
-        return Err(format!("Model đã đạt giới hạn {num_predict} token đầu ra (thinking + trả lời dùng chung). Phần đã nhận được giữ lại; tăng output trong cấu hình hoặc yêu cầu trả lời ngắn hơn."));
-    }
+    let length = done && frame.get("done_reason").and_then(Value::as_str) == Some("length");
     if done {
         let eval_count = frame["eval_count"].as_u64();
         let eval_duration = frame["eval_duration"].as_u64();
@@ -577,6 +668,9 @@ fn consume(
         };
         if eval_count.is_some() || speed.is_some() {
             *metrics = Some(crate::storage::ChatMetrics {
+                thinking_tokens: Some(counts.thinking),
+                answer_tokens: Some(counts.answer),
+                thinking_capped: counts.thinking_capped,
                 output_tokens: eval_count,
                 prompt_tokens: prompt_count,
                 eval_duration_ms: eval_duration.map(|d| d / 1_000_000),
@@ -612,5 +706,49 @@ fn consume(
             }
         }
     }
-    Ok(done)
+    Ok(if length { Step::Length } else if done { Step::Done } else { Step::Continue })
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use tauri::ipc::InvokeResponseBody;
+
+    /// Runs `generate` against the local Ollama. `cargo test --lib split_budgets -- --ignored --nocapture`
+    fn run_case(model: &str, think: usize, answer: usize, prompt: &str) {
+        let dir = std::env::temp_dir().join(format!("lim-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runtime = Runtime::new(crate::storage::Store::open(&dir.join("t.sqlite3")).unwrap()).unwrap();
+        let session = runtime.store.create_session().unwrap().id;
+        let run = Uuid::new_v4().to_string();
+        let (_, mut assistant) = runtime.store.begin(&session, &run, model, prompt).unwrap();
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let sink = events.clone();
+        let channel: Channel<Value> = Channel::new(move |body| {
+            if let InvokeResponseBody::Json(raw) = body {
+                sink.lock().unwrap().push(serde_json::from_str(&raw).unwrap());
+            }
+            Ok(())
+        });
+        let settings = InferenceSettings { think_predict: think, num_predict: answer, ..Default::default() };
+        let (mut sequence, mut content, mut thinking, mut metrics) = (0, String::new(), String::new(), None);
+        let result = tauri::async_runtime::block_on(generate(&runtime, &session, &run, model, prompt, 4096, &settings, &mut assistant, &channel, &mut sequence, &mut content, &mut thinking, &mut metrics));
+        let usage: Vec<Value> = events.lock().unwrap().iter().filter(|e| e["type"] == "usage").map(|e| e["usage"].clone()).collect();
+        println!("think={think} answer={answer} -> {:?}\n  thinking chars {} | answer chars {}\n  last usage {:?}\n  metrics {:?}\n  answer: {:?}",
+            result, thinking.len(), content.len(), usage.last(),
+            metrics.as_ref().map(|m: &crate::storage::ChatMetrics| (m.output_tokens, m.thinking_tokens, m.answer_tokens, m.thinking_capped)),
+            content.chars().take(160).collect::<String>());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    #[ignore]
+    fn split_budgets() {
+        let model = "qwen3.5:2b";
+        // Thinking capped early: phase 2 must still produce an answer with its own budget.
+        run_case(model, 64, 400, "Trước đó tôi đã nói gì?");
+        // Thinking off.
+        run_case(model, 0, 200, "Xin chào, bạn là ai?");
+        // Normal budgets.
+        run_case(model, 1024, 1024, "2 + 2 bằng mấy? Trả lời ngắn.");
+    }
 }

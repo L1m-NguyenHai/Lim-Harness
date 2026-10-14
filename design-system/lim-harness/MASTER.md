@@ -1,8 +1,8 @@
-# Lim Harness — Frontend design system v0.6
+# Lim Harness — Frontend design system v0.7
 
 ## Direction
 
-Chat-first desktop harness inspired by Odysseus: one compact left sidebar and a broad chat canvas. Neutral light surfaces, charcoal dark surfaces and restrained coral accent. Vietnamese copy and Tauri native window chrome. Keep chat, memory, modules and settings. Session history stays in the sidebar and search.
+Chat-first desktop harness inspired by Odysseus: one compact left sidebar and a broad chat canvas. Minimal zinc surfaces (white light, near-black dark) with a single green accent; visual direction referenced from canirun.ai (look only, no code or assets copied). Light is the default theme. Vietnamese copy and Tauri native window chrome. Keep chat, memory, modules and settings. Session history stays in the sidebar and search.
 
 Verified reference: `odysseus/assets/branding/odysseus-browser.jpg`, `odysseus/static/index.html` (sidebar, welcome and composer) and `odysseus/static/css/01-agent-chat.css` (sidebar, history and compact-height rules). This is a visual/interaction reference; no Odysseus source code or assets are copied into the shipped UI. Odysseus remains unchanged.
 
@@ -10,9 +10,9 @@ UI UX Pro Max quick reference informs accessibility and interaction. Its CLI did
 
 ## Tokens
 
-Implementation source: `src/tokens.css`. Light/dark semantic colors for background, surface, sidebar, text, muted, border, accent and focus. Light primary #983e4c with white text, background #f7f7f8. Dark primary #e6a0a8 with #24272e text, background #262a33. Checked semantic text pairs: minimum 5.07:1 light and 5.97:1 dark.
+Implementation source: `src/tokens.css`; theme layer `src/console.css`. Light: background/surface #ffffff, sidebar #fafafa, text #18181b, muted #52525b, border #e4e4e7, accent #15803d with white text. Dark: background #09090b, surface #111113, text #fafafa, muted #a1a1aa, border #27272a, accent #4ade80 with #052e16 text. `npm run test:colors`: minimum 5.02:1 light, 6.63:1 dark.
 
-System font stack: Segoe UI, Inter if installed, system-ui. No separate display font, font CDN or remote imagery. Normal body text 14px, supporting text 11–13px and restrained 24–28px headings.
+Fonts: Geist (sans) for UI and prose, Geist Mono for technical labels (section labels in lowercase, model names, numbers, hints, chips). Bundled locally via `@fontsource-variable/geist` and `@fontsource-variable/geist-mono` (OFL-1.1, includes Vietnamese subset); no font CDN. Body 14px, chat 15px, hints 12px, welcome title 34px mono. Pills (999px) for chips/model buttons, 7–8px radius for controls, 12–14px for composer and windows.
 
 ## Layout and interaction
 

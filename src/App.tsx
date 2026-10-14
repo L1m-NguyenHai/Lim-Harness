@@ -1,11 +1,15 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Logo from "./Logo";
 import Cookbook from "./Cookbook";
 import FloatingWindow from "./FloatingWindow";
 import type { WindowMode } from "./FloatingWindow";
 import { core, native, defaultInference } from "./core";
-import type { InferenceSettings } from "./core";
+import type { InferenceSettings, RunUsage } from "./core";
 import { InferencePanel } from "./InferencePanel";
+import { ContextMeter } from "./ContextMeter";
+import { ThinkingSteps } from "./ThinkingSteps";
+import { thinkingSteps } from "./thinking-steps";
+import { contextUsage } from "./context-usage";
 import type { VaultHit } from "./core";
 import {
   ArrowUp,
@@ -30,10 +34,11 @@ import {
   X,
   Copy,
   Square,
+  Trash2,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { moduleCatalog, newSession, readState, STORAGE_KEY } from "./state";
-import type { Note, Page, State } from "./state";
+import type { Note, Page, SessionConfig, State } from "./state";
 
 const navigation: { id: Page; label: string; icon: LucideIcon }[] = [
   { id: "chat", label: "Hội thoại", icon: MessageSquare },
@@ -67,11 +72,24 @@ function splitThink(text: string): { thinking: string; answer: string } {
     answer: (text.slice(0, match.index) + text.slice((match.index ?? 0) + match[0].length)).trim(),
   };
 }
-function formatMetrics(m?: { tokensPerSecond?: number; outputTokens?: number; promptTokens?: number; totalDurationMs?: number; evalDurationMs?: number }): string {
+// Live per-phase token estimate while a run streams (Ollama sends ~1 token per chunk).
+function liveUsage(meta: { startedAt: number; chars: number; usage?: RunUsage }): string {
+  const u = meta.usage;
+  const seconds = (Date.now() - meta.startedAt) / 1000;
+  const parts: string[] = [];
+  if (u && u.thinkingBudget > 0) parts.push(`Suy nghĩ ~${u.thinkingTokens}/${u.thinkingBudget}${u.thinkingCapped ? " (đã dừng)" : ""}`);
+  if (u) parts.push(`Trả lời ~${u.answerTokens}/${u.answerBudget} token`);
+  const total = u ? u.thinkingTokens + u.answerTokens : meta.chars / 4;
+  if (seconds > 0.5 && total > 0) parts.push(`${(total / seconds).toFixed(1)} token/s`);
+  return parts.length ? `${parts.join(" · ")} · ước tính…` : "Đang chạy…";
+}
+function formatMetrics(m?: import("./state").ChatMetrics): string {
   if (!m) return "";
   const parts: string[] = [];
   if (m.tokensPerSecond != null && Number.isFinite(m.tokensPerSecond))
     parts.push(`${m.tokensPerSecond.toFixed(1)} token/s`);
+  if (m.thinkingTokens) parts.push(`suy nghĩ ~${m.thinkingTokens}${m.thinkingCapped ? " (chạm giới hạn)" : ""}`);
+  if (m.answerTokens != null && m.thinkingTokens) parts.push(`trả lời ~${m.answerTokens}`);
   if (m.outputTokens != null) parts.push(`${m.outputTokens} token`);
   const ms = m.totalDurationMs ?? m.evalDurationMs;
   if (ms != null) parts.push(ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`);
@@ -81,7 +99,7 @@ function formatMetrics(m?: { tokensPerSecond?: number; outputTokens?: number; pr
 export default function App() {
   const [loaded] = useState(() => {
     const loaded = readState();
-    try { if (!localStorage.getItem("lim-console-style-v1")) loaded.state.preferences.theme = "dark"; } catch { /* Keep app usable without browser storage. */ }
+    try { if (!localStorage.getItem("lim-minimal-style-v1")) loaded.state.preferences.theme = "light"; } catch { /* Keep app usable without browser storage. */ }
     return loaded;
   });
   const [state, setState] = useState<State>(loaded.state);
@@ -105,7 +123,8 @@ export default function App() {
   const [modelError, setModelError] = useState("");
   const [runtimeError, setRuntimeError] = useState("");
   const [running, setRunning] = useState<Record<string, string>>({});
-  const [streamMeta, setStreamMeta] = useState<Record<string, { startedAt: number; chars: number }>>({});
+  const [pendingDelete, setPendingDelete] = useState("");
+  const [streamMeta, setStreamMeta] = useState<Record<string, { startedAt: number; chars: number; usage?: RunUsage }>>({});
   const runLock = useRef(new Set<string>());
   const [vaultPath, setVaultPath] = useState("");
   const [vaultDraft, setVaultDraft] = useState("");
@@ -130,6 +149,15 @@ export default function App() {
   const messageEnd = useRef<HTMLDivElement>(null);
   const session = state.sessions.find((s) => s.id === state.active)!;
   const selectedModules = state.preferences.modules.length;
+  // Run settings of the open session; everything in the panel follows the selected session.
+  // Merged over full values so configs saved by older versions (only some fields) stay complete.
+  const effective: SessionConfig = { ...inferenceSettings, contextSize, ...session.config };
+  const effectiveKey = JSON.stringify(effective);
+  // Keyed by value so a refreshed snapshot with identical settings does not reset the panel draft.
+  const panelSettings = useMemo<InferenceSettings>(() => { const { contextSize: _context, ...settings } = JSON.parse(effectiveKey) as SessionConfig; return settings; }, [effectiveKey]);
+  function applySessionConfig(id: string, config: SessionConfig) {
+    setState((c) => ({ ...c, sessions: c.sessions.map((s) => s.id === id ? { ...s, config } : s) }));
+  }
   const activeSession = useRef(state.active);
   activeSession.current = state.active;
   const busy = !!running[session.id];
@@ -196,17 +224,20 @@ export default function App() {
       setState((c) => ({ ...c, preferences: { ...c.preferences, provider: "ollama", model } }));
     } catch (error) { setRuntimeError(String(error)); }
   }
+  // Context picked in Cookbook/Settings applies to the open session only.
   async function chooseContext(size: number) {
-    if (!native) { setContextSize(size); return; }
-    try { await core.setContext(size); setContextSize(size); }
-    catch (error) { setRuntimeError(String(error)); }
+    const config = { ...effective, contextSize: size };
+    try {
+      if (native) await core.setSessionConfig(session.id, config);
+      applySessionConfig(session.id, config);
+    } catch (error) { setRuntimeError(String(error)); }
   }
   useEffect(() => { try { localStorage.setItem("lim-inference-open", String(inferenceOpen)); } catch { /* UI remains usable without persistence. */ } }, [inferenceOpen]);
+  // Every parameter in the panel is saved on the open session only; other sessions keep theirs.
   async function saveInference(settings: InferenceSettings, size: number) {
-    if (native) await core.setInference(settings, size);
-    else localStorage.setItem("lim-inference-preview", JSON.stringify({ ...settings, contextSize: size }));
-    setInferenceSettings(settings);
-    setContextSize(size);
+    const config = { ...settings, contextSize: size };
+    if (native) await core.setSessionConfig(session.id, config);
+    applySessionConfig(session.id, config);
   }
   async function connectVault(path: string) {
     setMemoryBusy(true);
@@ -233,7 +264,7 @@ export default function App() {
     if (loaded.error) return;
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-      localStorage.setItem("lim-console-style-v1", "1");
+      localStorage.setItem("lim-minimal-style-v1", "1");
       setStorageError("");
     } catch {
       setStorageError(
@@ -276,7 +307,7 @@ export default function App() {
   async function createSession() {
     if (!ready) return;
     let next;
-    try { next = native ? await core.createSession() : newSession(); }
+    try { next = native ? await core.createSession() : { ...newSession(), config: { ...defaultInference, contextSize: 4096 } }; }
     catch (error) { setRuntimeError(String(error)); return; }
     setState((c) => ({
       ...c,
@@ -287,6 +318,27 @@ export default function App() {
     setAttachment(null);
     setPage("chat");
     composer.current?.focus();
+  }
+  // Two-step delete: the first click arms the button, the second removes the session.
+  async function deleteSession(id: string) {
+    if (!ready) return;
+    if (running[id]) { setRuntimeError("Phiên đang chạy; dừng trả lời trước khi xoá."); return; }
+    if (pendingDelete !== id) { setPendingDelete(id); return; }
+    setPendingDelete("");
+    try { if (native) await core.deleteSession(id); }
+    catch (error) { setRuntimeError(String(error)); return; }
+    let replacement = null;
+    if (state.sessions.length === 1) {
+      try { replacement = native ? await core.createSession() : newSession(); }
+      catch (error) { setRuntimeError(String(error)); }
+    }
+    setState((c) => {
+      const rest = c.sessions.filter((s) => s.id !== id);
+      const sessions = replacement ? [replacement, ...rest] : rest;
+      if (!sessions.length) return c;
+      return { ...c, sessions, active: c.active === id ? sessions[0].id : c.active };
+    });
+    if (state.active === id) { setDraft(""); setAttachment(null); }
   }
   function openSession(id: string) {
     setState((c) => ({ ...c, active: id }));
@@ -353,7 +405,8 @@ export default function App() {
         sequence = event.sequence;
         if (event.type === "started" && activeSession.current === sessionId) { setDraft(""); setAttachment(null); }
         if (event.type === "started") setStreamMeta((c) => ({ ...c, [sessionId]: { startedAt: Date.now(), chars: 0 } }));
-        if (event.type === "text_delta") setStreamMeta((c) => ({ ...c, [sessionId]: { startedAt: c[sessionId]?.startedAt ?? Date.now(), chars: (c[sessionId]?.chars ?? 0) + (event.delta ?? "").length } }));
+        if (event.type === "usage" && event.usage) { const usage = event.usage; setStreamMeta((c) => ({ ...c, [sessionId]: { startedAt: c[sessionId]?.startedAt ?? Date.now(), chars: c[sessionId]?.chars ?? 0, usage } })); }
+        if (event.type === "text_delta") setStreamMeta((c) => ({ ...c, [sessionId]: { startedAt: c[sessionId]?.startedAt ?? Date.now(), chars: (c[sessionId]?.chars ?? 0) + (event.delta ?? "").length, usage: c[sessionId]?.usage } }));
         if (event.type === "memory_sources" && (event.truncated || event.skippedFiles)) setMemoryStatus("Lượt tìm ghi chú có tệp bỏ qua hoặc đã chạm giới hạn; nguồn có thể chưa đầy đủ.");
         setRunning((c) => ({ ...c, [sessionId]: event.runId }));
         const previousId = currentAssistantId;
@@ -369,6 +422,7 @@ export default function App() {
             if (event.sources) base.sources = event.sources;
             if (["completed", "cancelled", "failed"].includes(event.type))
               base.status = event.type as "completed" | "cancelled" | "failed";
+            if (event.type === "failed" && event.error) base.error = event.error;
             return base;
           }),
         }) }));
@@ -527,16 +581,27 @@ export default function App() {
           <div className="session-label">Hội thoại gần đây</div>
           <div className="session-list">
             {state.sessions.map((s) => (
-              <button
-                className={`session-item ${state.active === s.id && page === "chat" ? "selected" : ""}`}
-                key={s.id}
-                onClick={() => openSession(s.id)}
-                title={s.title}
-                aria-label={`Mở phiên: ${s.title}`}
-              >
-                <MessageSquare size={14} />
-                <span>{s.title}</span>
-              </button>
+              <div className={`session-row ${state.active === s.id && page === "chat" ? "selected" : ""}`} key={s.id} onMouseLeave={() => pendingDelete === s.id && setPendingDelete("")}>
+                <button
+                  className={`session-item ${state.active === s.id && page === "chat" ? "selected" : ""}`}
+                  onClick={() => openSession(s.id)}
+                  title={s.title}
+                  aria-label={`Mở phiên: ${s.title}`}
+                >
+                  <MessageSquare size={14} />
+                  <span>{s.title}</span>
+                </button>
+                <button
+                  className={`session-delete ${pendingDelete === s.id ? "armed" : ""}`}
+                  onClick={() => void deleteSession(s.id)}
+                  onBlur={() => pendingDelete === s.id && setPendingDelete("")}
+                  disabled={!ready || Boolean(running[s.id])}
+                  title={running[s.id] ? "Đang chạy, chưa xoá được" : pendingDelete === s.id ? "Bấm lần nữa để xoá vĩnh viễn" : "Xoá hội thoại"}
+                  aria-label={pendingDelete === s.id ? `Xác nhận xoá phiên: ${s.title}` : `Xoá phiên: ${s.title}`}
+                >
+                  {pendingDelete === s.id ? <span>Xoá?</span> : <Trash2 size={13} aria-hidden="true" />}
+                </button>
+              </div>
             ))}
           </div>
           {Object.values(windows).includes("minimized") && <nav className="window-dock" aria-label="Cửa sổ đã thu gọn"><span className="dock-label">Đã thu gọn</span>{(Object.keys(toolTitles) as ToolPage[]).filter((id) => windows[id] === "minimized").map((id) => { const Icon = navigation.find((item) => item.id === id)?.icon || Settings2; return <button key={id} onClick={() => setPage(id)} aria-label={`Khôi phục ${toolTitles[id]}`} title={`Khôi phục ${toolTitles[id]}`}><Icon size={14} aria-hidden="true" /><span>{toolTitles[id]}</span></button>; })}</nav>}
@@ -586,7 +651,7 @@ export default function App() {
           {(
             <header className="topbar">
               <span className="session-title">{session.title}</span>
-              <div className="runtime-hud" aria-label="Cấu hình model hiện tại"><span className="hud-model" title={state.preferences.model}>{state.preferences.model || "Ollama · chưa chọn model"}</span><span className="hud-temperature">temp={inferenceSettings.temperature.toFixed(2)}</span><span className="hud-context">CTX {contextSize / 1024}K</span></div>
+              <div className="runtime-hud" aria-label="Cấu hình model hiện tại"><span className="hud-model" title={state.preferences.model}>{state.preferences.model || "Ollama · chưa chọn model"}</span><span className="hud-temperature">temp={effective.temperature.toFixed(2)}</span><ContextMeter usage={contextUsage(session.messages, draft, effective.contextSize, effective.numPredict + effective.thinkPredict, effective.systemPrompt)} memory={Boolean(vaultPath)} /></div>
               <button className={`icon-button inference-toggle ${inferenceDirty ? "has-draft" : ""}`} aria-label={inferenceDirty ? "Tham số chạy model · có thay đổi chưa áp dụng" : "Tham số chạy model"} title="Tham số chạy model" aria-expanded={inferenceOpen} aria-controls="inference-heading" onClick={() => setInferenceOpen((open) => !open)}><Settings2 size={17} /></button>
             </header>
           )}
@@ -602,7 +667,7 @@ export default function App() {
             className={`chat-main chat-column ${!session.messages.length ? "chat-empty" : ""}`}
           >
             <FloatingWindow {...windowProps("cookbook")} width={1100} height={780}>
-              <Cookbook visible={windows.cookbook === "open"} selectedModel={state.preferences.model} contextSize={contextSize} chatBusy={Object.keys(running).length > 0} onContext={(size) => void chooseContext(size)} onChat={() => setPage("chat")} onSelected={(model, size) => {
+              <Cookbook visible={windows.cookbook === "open"} selectedModel={state.preferences.model} contextSize={effective.contextSize} chatBusy={Object.keys(running).length > 0} onContext={(size) => void chooseContext(size)} onChat={() => setPage("chat")} onSelected={(model, size) => {
                 setContextSize(size);
                 setState((c) => ({ ...c, preferences: { ...c.preferences, provider: "ollama", model } }));
                 void refreshModels();
@@ -644,9 +709,7 @@ export default function App() {
                         const answer = isUser ? m.text : (parsed?.answer ?? m.text);
                         const isRunning = m.status === "running";
                         const meta = streamMeta[session.id];
-                        const liveSpeed = isRunning && !isUser && meta && Date.now() - meta.startedAt > 500
-                          ? `${((meta.chars / 4) / ((Date.now() - meta.startedAt) / 1000)).toFixed(1)} token/s · đang trả lời…`
-                          : "";
+                        const liveSpeed = isRunning && !isUser && meta ? liveUsage(meta) : "";
                         return (
                         <article className={`message ${m.role}`} key={m.id}>
                           <span className="message-avatar" aria-hidden="true">
@@ -660,16 +723,20 @@ export default function App() {
                               )}
                             </div>
                             {!isUser && thinking && (
-                              <details className="message-thinking" open={isRunning && !answer.trim()}>
-                                <summary>{isRunning && !answer.trim() ? "Đang suy nghĩ…" : "Quá trình suy nghĩ"}</summary>
-                                <p>{thinking}</p>
-                              </details>
+                              (() => {
+                                const steps = thinkingSteps(thinking);
+                                const live = isRunning && !answer.trim();
+                                return <details className="message-thinking" open={live}>
+                                  <summary>{live ? `Đang suy nghĩ · bước ${steps.length}` : "Quá trình suy nghĩ"}<span className="thinking-count">{steps.length} bước{m.metrics?.thinkingTokens ? ` · ~${m.metrics.thinkingTokens} token` : ""}{m.metrics?.thinkingCapped ? " · chạm giới hạn" : ""}</span></summary>
+                                  <ThinkingSteps steps={steps} live={live} />
+                                </details>;
+                              })()
                             )}
                             <div className="message-bubble">
                               <p>{answer || (isRunning ? "Đang chờ model…" : "Không có nội dung trả lời.")}</p>
                             </div>
                             {m.source === "ui_preview" && <small className="message-status">Thông báo từ bản UI thử</small>}
-                            {m.status && m.status !== "completed" && !isUser && <small className="message-status">{{ running: liveSpeed || "Đang trả lời", cancelled: "Đã dừng · câu trả lời chưa hoàn tất", failed: "Lượt chạy bị lỗi", interrupted: "Bị gián đoạn khi đóng ứng dụng" }[m.status]}</small>}
+                            {m.status && m.status !== "completed" && !isUser && <small className="message-status">{{ running: liveSpeed || "Đang trả lời", cancelled: "Đã dừng · câu trả lời chưa hoàn tất", failed: m.error ? `Lượt chạy bị lỗi: ${m.error}` : "Lượt chạy bị lỗi", interrupted: "Bị gián đoạn khi đóng ứng dụng" }[m.status]}</small>}
                             {!isUser && m.metrics && m.status === "completed" && formatMetrics(m.metrics) && (
                               <small className="message-metrics">{formatMetrics(m.metrics)}</small>
                             )}
@@ -911,7 +978,7 @@ export default function App() {
                     <button className="secondary-button" disabled={!native || !ready} onClick={() => void refreshModels()}>Tải lại danh sách</button>
                     <button className="secondary-button" onClick={() => setPage("cookbook")}>Mở Cookbook</button>
                     <p className="settings-status" role="status">{modelError || "Ollama tại 127.0.0.1:11434. Model và hội thoại được lưu bởi lõi desktop."}</p>
-                    <div className="field-row"><label htmlFor="context-size">Context</label><select id="context-size" value={contextSize} disabled={!native || !ready} onChange={(e) => void chooseContext(Number(e.target.value))}><option value={4096}>4K · tiết kiệm bộ nhớ</option><option value={8192}>8K</option><option value={16384}>16K · cần thêm RAM/VRAM</option></select></div>
+                    <div className="field-row"><label htmlFor="context-size">Context</label><select id="context-size" value={effective.contextSize} disabled={!native || !ready} onChange={(e) => void chooseContext(Number(e.target.value))}><option value={4096}>4K · tiết kiệm bộ nhớ</option><option value={8192}>8K</option><option value={16384}>16K · cần thêm RAM/VRAM</option></select></div>
                   </section>
                   <section className="settings-section">
                     <h2>Bộ nhớ Obsidian</h2>
@@ -923,7 +990,7 @@ export default function App() {
               </>
             </FloatingWindow>
           </main>
-          <InferencePanel open={inferenceOpen} settings={inferenceSettings} contextSize={contextSize} model={state.preferences.model} ready={ready} onDirty={setInferenceDirty} onSave={saveInference} onClose={() => setInferenceOpen(false)} />
+          <InferencePanel key={session.id} sessionTitle={session.title} open={inferenceOpen} settings={panelSettings} contextSize={effective.contextSize} model={state.preferences.model} ready={ready} onDirty={setInferenceDirty} onSave={saveInference} onClose={() => setInferenceOpen(false)} />
           </div>
         </div>
       </div>

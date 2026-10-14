@@ -97,3 +97,4 @@
   .cookbook-model-name > span:first-of-type { max-width: 160px; }
   .cookbook-statusbar { flex-wrap: wrap; }
 }
+.cookbook-search .icon-button { width: 24px; height: 24px; padding: 4px; flex-shrink: 0; color: var(--muted); }

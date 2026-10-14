@@ -53,15 +53,18 @@ fn valid_model(model: &str) -> Result<(), String> {
     let mut parts = model.split(':');
     let name = parts.next().unwrap_or_default();
     let tag = parts.next();
-    let segments: Vec<&str> = name.split('/').collect();
+    // Hugging Face GGUF repos are pulled by Ollama as hf.co/<user>/<repo>[:<quant>].
+    let hugging_face = name.strip_prefix("hf.co/");
+    let segments: Vec<&str> = hugging_face.unwrap_or(name).split('/').collect();
     if model.len() > 200
         || parts.next().is_some()
         || segments.len() > 2
+        || (hugging_face.is_some() && segments.len() != 2)
         || !segments.iter().all(|segment| valid_segment(segment))
-        || (segments.len() == 2 && segments[0].contains('.'))
+        || (hugging_face.is_none() && segments.len() == 2 && segments[0].contains('.'))
         || tag.is_some_and(|tag| !valid_segment(tag))
     {
-        return Err("Nhập tên hoặc namespace/tên:tag của Ollama, tối đa 200 ký tự. Không nhập URL, đường dẫn Hugging Face hoặc registry riêng.".into());
+        return Err("Nhập tag Ollama (qwen3:4b, namespace/tên:tag) hoặc repo GGUF Hugging Face dạng hf.co/user/repo:Q4_K_M, tối đa 200 ký tự. Không nhập URL hoặc registry riêng.".into());
     }
     Ok(())
 }
@@ -594,5 +597,19 @@ fn hardware_snapshot() -> Value {
         }
         hardware["notes"] = json!(notes);
         hardware
+    }
+}
+
+#[cfg(test)]
+mod model_name_tests {
+    use super::valid_model;
+    #[test]
+    fn accepts_ollama_and_hugging_face_names() {
+        for ok in ["qwen3:4b", "library/qwen3", "user/model:tag", "hf.co/unsloth/Qwen3-4B-GGUF:Q4_K_M", "hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF"] {
+            assert!(valid_model(ok).is_ok(), "{ok}");
+        }
+        for bad in ["hf.co/onlyrepo", "hf.co/a/b/c", "example.com/user/model", "https://huggingface.co/a/b", "a:b:c", "../x"] {
+            assert!(valid_model(bad).is_err(), "{bad}");
+        }
     }
 }

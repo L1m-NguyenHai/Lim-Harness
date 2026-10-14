@@ -9,8 +9,11 @@ Snapshot kèm app hiện có **67 tag từ 20 family**, thu thập ngày 13/10/2
 - Config có thể redirect đến CDN Ollama: chỉ chấp nhận HTTPS, bucket/đường dẫn config đã xác nhận và giới hạn 64 KiB. Không ghi signed URL vào nhật ký.
 - Model đã cài/đang nạp ghép từ Ollama local `/api/tags`, `/api/ps`.
 - Native “Cập nhật catalog” đọc online có giới hạn, cache SQLite 24 giờ; lỗi mạng giữ cache hoặc snapshot cũ. HTML/registry không phải API catalog ổn định; thay đổi cấu trúc sẽ báo cảnh báo thay vì tự đoán metadata.
+- **Hugging Face (động):** API công khai `huggingface.co/api/models?filter=gguf&sort=downloads` (kèm `gguf.total`, `gguf.context_length`, `pipeline_tag`) và danh sách tệp `/api/models/<repo>/tree/main` để lấy kích thước từng quant. Mỗi repo chọn quant mặc định (Q4_K_M hoặc gần nhất) và Q8_0 nếu có; bỏ tệp chia nhiều phần, thư mục con, repo gated/private. Có `mmproj` → vision, kích thước cộng thêm projector. Tên tải là `hf.co/<user>/<repo>:<QUANT>`, Ollama pull trực tiếp. Không tải weights khi đọc metadata.
+- Catalog online mặc định = tối đa 20 family / 80 tag Ollama + 24 repo GGUF nhiều lượt tải nhất trên HF. Lỗi một nguồn chỉ thành cảnh báo, nguồn còn lại vẫn dùng được. Đo 14/10/2026: 96 mục (36 HF) trong ~37 giây.
+- **Tìm online** (lệnh `search_model_catalog`, tab Download): tìm theo từ khóa trên `ollama.com/search` (6 family, 24 tag) và HF (16 repo), lọc theo nguồn; kết quả không cache, hết hạn 45 giây. Direct Download chấp nhận `hf.co/user/repo:QUANT` hoặc dán link `huggingface.co/...`.
 
-Snapshot được tạo bằng `npm run catalog:refresh` (script `scripts/refresh-model-catalog.mjs`). App đọc online bằng `src-tauri/src/catalog.rs`. Giới hạn hiện tại khoảng 20 family / 80 tag, không phải toàn bộ Library và không phải catalog Hugging Face/llama.cpp. Metadata thiếu được giữ là chưa xác định/partial.
+Snapshot được tạo bằng `npm run catalog:refresh` (script `scripts/refresh-model-catalog.mjs`, hiện chỉ Ollama) và chỉ là dự phòng khi chưa có mạng. App đọc online bằng `src-tauri/src/catalog.rs`. Không phải toàn bộ Ollama Library/HF; dùng Tìm online để mở rộng. Metadata thiếu được giữ là chưa xác định/partial.
 
 ## Các cột đánh giá
 
