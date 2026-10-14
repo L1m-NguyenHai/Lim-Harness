@@ -32,6 +32,7 @@ pub fn run() {
             runtime::search_memory,
             runtime::list_models,
             runtime::start_turn,
+            runtime::continue_turn,
             runtime::cancel_turn,
             cookbook::cookbook_snapshot,
             cookbook::start_model_setup,

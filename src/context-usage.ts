@@ -26,8 +26,11 @@ export type ContextUsage = {
 
 export function contextUsage(messages: Message[], draft: string, contextSize: number, numPredict: number, systemPrompt: string): ContextUsage {
   const historyBudgetBytes = Math.max(0, contextSize - (numPredict + utf8Bytes(systemPrompt) + 256));
-  // Same eligibility as bounded_history: skip UI previews, empty text and unfinished replies.
-  const eligible = messages.filter((m) => m.source !== "ui_preview" && m.text && (m.role !== "assistant" || m.status === "completed"));
+  // Mirrors runtime.rs conversation(): answered turns only; a question without a usable answer
+  // is dropped (the draft becomes the latest question).
+  const usable = (m?: Message) => m?.role === "assistant" && m.text.trim() !== "" && (m.status === "completed" || m.status === "truncated");
+  const visible = messages.filter((m) => m.source !== "ui_preview");
+  const eligible = visible.filter((m, i) => m.text && (m.role === "user" ? usable(visible[i + 1]) : usable(m) && visible[i - 1]?.role === "user"));
   const pending = draft.trim() ? [{ role: "user", text: draft.trim() } as Message] : [];
   const candidates = [...eligible, ...pending];
   let remaining = historyBudgetBytes;
@@ -39,7 +42,7 @@ export function contextUsage(messages: Message[], draft: string, contextSize: nu
     remaining -= cost; used += cost; included++;
   }
   const draftFits = !pending.length || utf8Bytes(pending[0].text) + 32 <= historyBudgetBytes;
-  const last = [...messages].reverse().find((m) => m.role === "assistant" && m.status === "completed" && m.metrics?.promptTokens != null);
+  const last = [...messages].reverse().find((m) => m.role === "assistant" && (m.status === "completed" || m.status === "truncated") && m.metrics?.promptTokens != null);
   const lastPromptTokens = last?.metrics?.promptTokens ?? null;
   const lastOutputTokens = last?.metrics?.outputTokens ?? null;
   const draftTokens = pending.length ? estimateTokens(pending[0].text) : 0;

@@ -17,18 +17,16 @@ const OLLAMA: &str = "http://127.0.0.1:11434";
 fn input_budget(context_size: usize, settings: &InferenceSettings) -> usize {
     context_size.saturating_sub(settings.output_reserve() + settings.system_prompt.len() + 256)
 }
-/// Streamed chunk counts per phase. Ollama streams about one token per chunk, so these are
-/// live estimates; the final Ollama eval_count stays the authoritative total.
+/// Streamed chunk counts. Ollama streams about one token per chunk, so these are live
+/// estimates; the final Ollama eval_count stays the authoritative total.
 pub(crate) struct Counts {
     thinking: u64,
     answer: u64,
-    think_budget: u64,
-    answer_budget: u64,
-    thinking_capped: bool,
+    budget: u64,
 }
 impl Counts {
     fn usage(&self) -> Value {
-        json!({"type":"usage","usage":{"thinkingTokens":self.thinking,"answerTokens":self.answer,"thinkingBudget":self.think_budget,"answerBudget":self.answer_budget,"thinkingCapped":self.thinking_capped}})
+        json!({"type":"usage","usage":{"thinkingTokens":self.thinking,"answerTokens":self.answer,"budget":self.budget}})
     }
 }
 enum Step {
@@ -203,7 +201,7 @@ pub fn start_turn(
         .saturating_sub(32)
         .min(8_000);
     if maximum == 0 {
-        return Err(format!("Context {context_size} không còn chỗ cho tin nhắn sau khi dành {} token output và {} byte system prompt. Giảm output/system prompt hoặc tăng context.",settings.num_predict,settings.system_prompt.len()));
+        return Err(format!("Context {context_size} không còn chỗ cho tin nhắn sau khi dành {} token output và {} byte system prompt. Giảm output/system prompt hoặc tăng context.",settings.output_reserve(),settings.system_prompt.len()));
     }
     if text.is_empty() || text.len() > maximum {
         return Err(format!("Tin nhắn cần từ 1 đến {maximum} byte UTF-8 với context {context_size}. Rút gọn nội dung, giảm system prompt/output hoặc tăng context trong cài đặt."));
@@ -255,7 +253,7 @@ pub fn start_turn(
             session_id,
             run_id,
             model,
-            text,
+            Some(text),
             context_size,
             settings,
             assistant,
@@ -265,6 +263,48 @@ pub fn start_turn(
             model_guard,
         )
         .await;
+    });
+    Ok(returned)
+}
+/// Continues an answer that stopped at the output limit in a new run with a fresh budget.
+#[tauri::command]
+pub fn continue_turn(
+    state: State<'_, Arc<Runtime>>,
+    session_id: String,
+    message_id: String,
+    model: String,
+    on_event: Channel<Value>,
+) -> Result<String, String> {
+    let model_guard = Arc::clone(&state.model_gate)
+        .try_read_owned()
+        .map_err(|_| "Cookbook đang chuẩn bị model; chờ hoàn tất hoặc hủy thao tác trước khi gửi.")?;
+    let model = model.trim().to_string();
+    if model.is_empty() || model.len() > 200 || model.contains(['\r', '\n']) {
+        return Err("Chọn model Ollama hợp lệ trước khi tiếp tục".into());
+    }
+    let (context_size, settings) = state.store.session_config(&session_id)?;
+    let run_id = Uuid::new_v4().to_string();
+    let (cancel, receiver) = watch::channel(false);
+    let assistant = {
+        let mut active = state.active.lock().map_err(|_| "Runtime không khả dụng")?;
+        if active.contains_key(&session_id) {
+            return Err("Phiên này đang có một lượt chạy".into());
+        }
+        let assistant = state.store.begin_continue(&session_id, &run_id, &message_id, &model)?;
+        active.insert(session_id.clone(), ActiveRun { id: run_id.clone(), cancel });
+        assistant
+    };
+    let mut sequence = 0;
+    if let Err(error) = emit(&on_event, &run_id, &session_id, &mut sequence, json!({"type":"started","message":assistant})) {
+        let persisted = state.store.finish(&session_id, &assistant, "truncated", None);
+        state.active.lock().map_err(|_| "Runtime không khả dụng")?.remove(&session_id);
+        persisted?;
+        return Err(error);
+    }
+    let runtime = Arc::clone(state.inner());
+    let returned = run_id.clone();
+    tauri::async_runtime::spawn(async move {
+        run_turn(runtime, session_id, run_id, model, None, context_size, settings, assistant, on_event, sequence, receiver, model_guard).await;
     });
     Ok(returned)
 }
@@ -288,7 +328,7 @@ async fn run_turn(
     session: String,
     run: String,
     model: String,
-    text: String,
+    text: Option<String>,
     context_size: usize,
     settings: InferenceSettings,
     mut assistant: Message,
@@ -297,15 +337,21 @@ async fn run_turn(
     mut cancelled: watch::Receiver<bool>,
     _model_guard: OwnedRwLockReadGuard<()>,
 ) {
-    let mut content = String::new();
-    let mut thinking = String::new();
-    let mut metrics: Option<crate::storage::ChatMetrics> = None;
+    // A continuation starts from the saved partial answer and reasoning.
+    let mut content = assistant.text.clone();
+    let mut thinking = assistant.thinking.clone().unwrap_or_default();
+    let mut metrics: Option<crate::storage::ChatMetrics> = assistant.metrics.clone();
     let result = if *cancelled.borrow() {
         Err("__cancelled__".into())
     } else {
         tokio::select! {
             _=cancelled.changed()=>Err("__cancelled__".into()),
-            result=tokio::time::timeout(Duration::from_secs(300),generate(&runtime,&session,&run,&model,&text,context_size,&settings,&mut assistant,&channel,&mut sequence,&mut content,&mut thinking,&mut metrics))=>result.unwrap_or_else(|_|Err("Lượt chạy vượt quá 5 phút và đã dừng.".into())),
+            result=tokio::time::timeout(Duration::from_secs(300),async {
+                match &text {
+                    Some(text) => generate(&runtime,&session,&run,&model,text,context_size,&settings,&mut assistant,&channel,&mut sequence,&mut content,&mut thinking,&mut metrics).await,
+                    None => continue_generate(&runtime,&session,&run,&model,context_size,&settings,&mut assistant,&channel,&mut sequence,&mut content,&mut thinking,&mut metrics).await,
+                }
+            })=>result.unwrap_or_else(|_|Err("Lượt chạy vượt quá 5 phút và đã dừng.".into())),
         }
     };
     assistant.text = content;
@@ -317,7 +363,8 @@ async fn run_turn(
     assistant.metrics = metrics;
     assistant.model = Some(model.clone());
     let (status, error) = match result {
-        Ok(()) => ("completed", None),
+        Ok(false) => ("completed", None),
+        Ok(true) => ("truncated", None),
         Err(e) if e == "__cancelled__" => ("cancelled", None),
         Err(e) => ("failed", Some(e)),
     };
@@ -339,16 +386,30 @@ async fn run_turn(
     let _ = emit(&channel, &run, &session, &mut sequence, event);
 }
 
+/// Messages the model should see: answered turns plus the latest question. A question whose
+/// answer is missing, empty, failed or cancelled is dropped with it, so the model never gets two
+/// user turns in a row (which made it reason about "which question to answer").
+fn conversation(messages: Vec<Message>) -> Vec<Message> {
+    let messages: Vec<Message> = messages.into_iter().filter(|m| m.source != "ui_preview").collect();
+    let usable = |m: &Message| m.role == "assistant" && !m.text.trim().is_empty() && matches!(m.status.as_deref(), Some("completed" | "truncated"));
+    let last_user = messages.iter().rposition(|m| m.role == "user");
+    let mut kept = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        let keep = if message.role == "user" {
+            Some(index) == last_user || messages.get(index + 1).is_some_and(usable)
+        } else {
+            usable(message) && index > 0 && messages[index - 1].role == "user"
+        };
+        if keep && !message.text.is_empty() {
+            kept.push(message.clone());
+        }
+    }
+    kept
+}
 fn bounded_history(messages: Vec<Message>, budget: usize) -> Vec<Value> {
     let mut selected = Vec::new();
     let mut remaining = budget;
-    for message in messages.into_iter().rev() {
-        if message.source == "ui_preview"
-            || message.text.is_empty()
-            || (message.role == "assistant" && message.status.as_deref() != Some("completed"))
-        {
-            continue;
-        }
+    for message in conversation(messages).into_iter().rev() {
         let cost = message.text.len() + 32;
         if cost > remaining {
             break;
@@ -376,7 +437,7 @@ async fn generate(
     content: &mut String,
     thinking: &mut String,
     metrics: &mut Option<crate::storage::ChatMetrics>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let mut history = Vec::new();
     if !settings.system_prompt.is_empty() {
         history.push(json!({"role":"system","content":settings.system_prompt}));
@@ -426,66 +487,186 @@ async fn generate(
     if let Some(seed) = settings.seed {
         options["seed"] = json!(seed);
     }
-    let thinking_on = settings.think_predict > 0;
-    let mut counts = Counts {
-        thinking: 0,
-        answer: 0,
-        think_budget: settings.think_predict as u64,
-        answer_budget: settings.num_predict as u64,
-        thinking_capped: false,
-    };
-    // Separate budgets with Ollama's exact token counting:
-    // phase 1 stops at exactly think_predict generated tokens (thinking plus any answer start);
-    // if cut there, phase 2 runs with thinking off and its own answer budget.
-    options["num_predict"] = json!(if thinking_on { settings.think_predict } else { settings.num_predict });
-    let mut request = json!({"model":model,"messages":history,"stream":true,"options":options});
-    if !thinking_on {
-        request["think"] = json!(false);
-    }
+    // One output limit shared by thinking and answer; Ollama counts it exactly.
+    options["num_predict"] = json!(settings.num_predict);
+    let request = json!({"model":model,"messages":history,"stream":true,"options":options});
+    let mut counts = Counts { thinking: 0, answer: 0, budget: settings.num_predict as u64 };
     let _ = emit(channel, run, session, sequence, counts.usage());
-    let mut step = stream_chat(runtime, &request, assistant, channel, run, session, sequence, content, thinking, metrics, model, context_size, &mut counts).await?;
-    if thinking_on && matches!(step, Step::Length) {
-        let phase_one = metrics.as_ref().and_then(|m| m.output_tokens).unwrap_or(0);
-        let answer_started = !content.trim().is_empty();
-        counts.thinking_capped = !answer_started;
-        let _ = emit(channel, run, session, sequence, counts.usage());
-        // Pass the reasoning so far; it fits in the space reserved for thinking.
-        let note = if answer_started {
-            format!("Ghi chú suy nghĩ của trợ lý cho câu hỏi cuối:\n{}", thinking.trim())
-        } else {
-            format!("Ghi chú suy nghĩ nháp của trợ lý cho câu hỏi cuối (đã dừng vì đạt giới hạn {} token suy nghĩ). Dùng nếu hữu ích, rồi trả lời trực tiếp:\n{}", settings.think_predict, thinking.trim())
-        };
-        let mut messages = history.clone();
-        match messages.first_mut() {
-            Some(first) if first["role"] == "system" => {
-                let merged = format!("{}\n\n{note}", first["content"].as_str().unwrap_or_default());
-                first["content"] = json!(merged);
-            }
-            _ => messages.insert(0, json!({"role":"system","content":note})),
-        }
-        // Answer already started: prefill it so Ollama continues the same assistant message.
-        if answer_started {
-            messages.push(json!({"role":"assistant","content":content.clone()}));
-        }
-        let remaining = (settings.num_predict as u64).saturating_sub(counts.answer).max(16);
-        let mut retry = request.clone();
-        retry["messages"] = json!(messages);
-        retry["think"] = json!(false);
-        retry["options"]["num_predict"] = json!(remaining);
-        step = stream_chat(runtime, &retry, assistant, channel, run, session, sequence, content, thinking, metrics, model, context_size, &mut counts).await?;
-        // eval_count of the retry covers only phase 2; report the whole run.
-        if let Some(m) = metrics.as_mut() {
-            m.output_tokens = Some(m.output_tokens.unwrap_or(0) + phase_one);
-            m.thinking_capped = counts.thinking_capped;
-            if let Ok(raw) = serde_json::to_value(&*m) {
-                let _ = emit(channel, run, session, sequence, json!({"type":"metrics","metrics":raw}));
-            }
-        }
-    }
+    let step = stream_chat(runtime, &request, assistant, channel, run, session, sequence, content, thinking, metrics, model, context_size, &mut counts).await?;
     let _ = emit(channel, run, session, sequence, counts.usage());
+    outcome(step, content)
+}
+/// Ok(true): stopped at the output limit (the answer can be continued); Ok(false): finished.
+fn outcome(step: Step, content: &str) -> Result<bool, String> {
     match step {
-        Step::Length => Err(format!("Câu trả lời đạt giới hạn {} token trả lời (suy nghĩ tính riêng). Phần đã nhận được giữ lại; tăng giới hạn trả lời hoặc yêu cầu trả lời ngắn hơn.", settings.num_predict)),
-        _ => completed(content),
+        Step::Length => Ok(true),
+        _ => completed(content).map(|()| false),
+    }
+}
+/// Continues an answer that stopped at the output limit, with a fresh output budget.
+/// The reasoning so far is passed as a note; an answer already started is prefilled so
+/// Ollama writes on from its last word.
+#[allow(clippy::too_many_arguments)]
+async fn continue_generate(
+    runtime: &Runtime,
+    session: &str,
+    run: &str,
+    model: &str,
+    context_size: usize,
+    settings: &InferenceSettings,
+    assistant: &mut Message,
+    channel: &Channel<Value>,
+    sequence: &mut u64,
+    content: &mut String,
+    thinking: &mut String,
+    metrics: &mut Option<crate::storage::ChatMetrics>,
+) -> Result<bool, String> {
+    let all = runtime.store.messages(session)?;
+    let index = all.iter().position(|m| m.id == assistant.id).ok_or("Không tìm thấy câu trả lời cần tiếp tục")?;
+    let prior: Vec<Message> = all.into_iter().take(index).collect();
+    // Budget in UTF-8 bytes at ~3 bytes per token (the reasoning already written counts at its
+    // real size, not at the stricter 1 byte = 1 token used for new turns).
+    let capacity = context_size * 3;
+    // Qwen-style models (ChatML with <think>) can resume the reasoning itself: the prompt is
+    // built raw and ends inside the open <think> block (or after it, inside the answer).
+    let resume_thinking = chatml_thinking(runtime, model).await;
+    let mut system = settings.system_prompt.clone();
+    let carried_thinking = if resume_thinking {
+        thinking.len()
+    } else {
+        // Other models: thinking off, the newest part of the draft passed as a note.
+        let mut draft = thinking.trim();
+        let limit = capacity / 3;
+        if draft.len() > limit {
+            let mut cut = draft.len() - limit;
+            while !draft.is_char_boundary(cut) {
+                cut += 1;
+            }
+            draft = &draft[cut..];
+        }
+        if !draft.is_empty() {
+            let note = if content.trim().is_empty() {
+                format!("Ghi chú suy nghĩ nháp của trợ lý cho câu hỏi cuối (đã dừng vì hết token). Dùng nếu hữu ích, rồi trả lời trực tiếp:
+{draft}")
+            } else {
+                format!("Ghi chú suy nghĩ của trợ lý cho câu hỏi cuối:
+{draft}")
+            };
+            system = if system.is_empty() { note } else { format!("{system}
+
+{note}") };
+        }
+        0
+    };
+    let mut history = Vec::new();
+    if !system.is_empty() {
+        history.push(json!({"role":"system","content":system}));
+    }
+    let mut carried = system.len() + carried_thinking + content.len() + 256 * 3;
+    if let Some(hits) = assistant.sources.as_ref().filter(|hits| !hits.is_empty()) {
+        let context = vault::memory_context(hits);
+        carried += context.len() + 32;
+        history.push(json!({"role":"user","content":context}));
+    }
+    // Keep room for a useful amount of output, then give the continuation whatever is left.
+    let wanted_output = settings.num_predict.min(512) * 3;
+    let transcript = bounded_history(prior, capacity.saturating_sub(carried + wanted_output));
+    if !transcript.last().is_some_and(|m| m["role"] == "user") {
+        return Err("Không đủ context để tiếp tục câu trả lời này. Tăng Context window (ví dụ 8K) rồi bấm Tiếp tục.".into());
+    }
+    let transcript_bytes: usize = transcript.iter().map(|m| m["content"].as_str().map_or(0, str::len) + 32).sum();
+    let room = capacity.saturating_sub(carried + transcript_bytes) / 3;
+    let num_predict = settings.num_predict.min(room);
+    if num_predict < 64 {
+        return Err(format!("Phần đã viết gần chiếm hết context {context_size} token nên không còn chỗ để tiếp tục. Tăng Context window rồi bấm Tiếp tục."));
+    }
+    history.extend(transcript);
+    let mut options = json!({"num_ctx":context_size,"num_predict":num_predict,"temperature":settings.temperature,"top_p":settings.top_p,"top_k":settings.top_k,"repeat_penalty":settings.repeat_penalty});
+    if let Some(seed) = settings.seed {
+        options["seed"] = json!(seed);
+    }
+    let (path, request, mut split) = if resume_thinking {
+        let mut prompt = String::new();
+        for message in &history {
+            prompt.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", message["role"].as_str().unwrap_or("user"), message["content"].as_str().unwrap_or_default()));
+        }
+        prompt.push_str("<|im_start|>assistant\n<think>\n");
+        prompt.push_str(thinking);
+        let answering = !content.trim().is_empty();
+        if answering {
+            prompt.push_str("\n</think>\n\n");
+            prompt.push_str(content);
+        }
+        ("/api/generate", json!({"model":model,"prompt":prompt,"raw":true,"stream":true,"options":options}), Some(ThinkSplit::new(!answering)))
+    } else {
+        if !content.trim().is_empty() {
+            history.push(json!({"role":"assistant","content":content.clone()}));
+        }
+        ("/api/chat", json!({"model":model,"messages":history,"stream":true,"think":false,"options":options}), None)
+    };
+    let previous = assistant.metrics.clone();
+    // The answer's limit grows by this run's limit: 1.047 → 2.094 → 3.141 …
+    let granted_before = previous.as_ref().and_then(|m| m.output_limit.or(m.output_tokens)).unwrap_or(settings.num_predict as u64);
+    let mut counts = Counts {
+        thinking: previous.as_ref().and_then(|m| m.thinking_tokens).unwrap_or(0),
+        answer: previous.as_ref().and_then(|m| m.answer_tokens).unwrap_or(0),
+        budget: granted_before + num_predict as u64,
+    };
+    let _ = emit(channel, run, session, sequence, counts.usage());
+    let step = stream_from(runtime, path, &request, split.as_mut(), assistant, channel, run, session, sequence, content, thinking, metrics, model, context_size, &mut counts).await?;
+    // Report the whole answer, not only this continuation request.
+    if let (Some(m), Some(before)) = (metrics.as_mut(), previous.and_then(|p| p.output_tokens)) {
+        m.output_tokens = Some(m.output_tokens.unwrap_or(0) + before);
+        if let Ok(raw) = serde_json::to_value(&*m) {
+            let _ = emit(channel, run, session, sequence, json!({"type":"metrics","metrics":raw}));
+        }
+    }
+    let _ = emit(channel, run, session, sequence, counts.usage());
+    outcome(step, content)
+}
+/// Splits raw ChatML output into thinking and answer at `</think>`, even when the tag is
+/// cut across stream chunks.
+pub(crate) struct ThinkSplit {
+    thinking: bool,
+    pending: String,
+    trim_answer: bool,
+}
+impl ThinkSplit {
+    fn new(thinking: bool) -> Self {
+        Self { thinking, pending: String::new(), trim_answer: false }
+    }
+    fn answer(&mut self, text: &str) -> String {
+        let mut text = text.replace("<|im_end|>", "");
+        if self.trim_answer {
+            text = text.trim_start().to_string();
+            self.trim_answer = text.is_empty();
+        }
+        text
+    }
+    /// Returns (thinking delta, answer delta).
+    fn push(&mut self, chunk: &str, done: bool) -> (String, String) {
+        if !self.thinking {
+            return (String::new(), self.answer(chunk));
+        }
+        self.pending.push_str(chunk);
+        const TAG: &str = "</think>";
+        if let Some(index) = self.pending.find(TAG) {
+            let thought = self.pending[..index].to_string();
+            let rest = self.pending[index + TAG.len()..].to_string();
+            self.pending.clear();
+            self.thinking = false;
+            self.trim_answer = true;
+            return (thought, self.answer(&rest));
+        }
+        if done {
+            return (std::mem::take(&mut self.pending), String::new());
+        }
+        // Hold back a tail that could be the start of the tag.
+        let keep = (1..TAG.len()).rev().find(|k| self.pending.ends_with(&TAG[..*k])).unwrap_or(0);
+        let ready = self.pending.len() - keep;
+        let thought = self.pending[..ready].to_string();
+        self.pending.drain(..ready);
+        (thought, String::new())
     }
 }
 #[allow(clippy::too_many_arguments)]
@@ -504,9 +685,31 @@ async fn stream_chat(
     context_size: usize,
     counts: &mut Counts,
 ) -> Result<Step, String> {
+    stream_from(runtime, "/api/chat", request, None, assistant, channel, run, session, sequence, content, thinking, metrics, model, context_size, counts).await
+}
+/// Streams from Ollama. With a splitter, raw `/api/generate` frames are turned into chat-style
+/// frames (message.thinking / message.content) so `consume` handles both endpoints.
+#[allow(clippy::too_many_arguments)]
+async fn stream_from(
+    runtime: &Runtime,
+    path: &str,
+    request: &Value,
+    mut split: Option<&mut ThinkSplit>,
+    assistant: &mut Message,
+    channel: &Channel<Value>,
+    run: &str,
+    session: &str,
+    sequence: &mut u64,
+    content: &mut String,
+    thinking: &mut String,
+    metrics: &mut Option<crate::storage::ChatMetrics>,
+    model: &str,
+    context_size: usize,
+    counts: &mut Counts,
+) -> Result<Step, String> {
     let response = runtime
         .client
-        .post(format!("{OLLAMA}/api/chat"))
+        .post(format!("{OLLAMA}{path}"))
         .json(request)
         .send()
         .await
@@ -534,6 +737,7 @@ async fn stream_chat(
                 }
                 while let Some(end) = pending.iter().position(|b| *b == b'\n') {
                     let line: Vec<u8> = pending.drain(..=end).collect();
+                    let line = match split.as_deref_mut() { Some(split) => raw_frame(&line, split)?, None => line };
                     match consume(&line, runtime, assistant, channel, run, session, sequence, content, thinking, metrics, model, context_size, counts)? {
                         Step::Continue => {}
                         step => return Ok(step),
@@ -545,6 +749,7 @@ async fn stream_chat(
             }
             None => {
                 if !pending.is_empty() {
+                    let pending = match split.as_deref_mut() { Some(split) => raw_frame(&pending, split)?, None => pending };
                     match consume(&pending, runtime, assistant, channel, run, session, sequence, content, thinking, metrics, model, context_size, counts)? {
                         Step::Continue => {}
                         step => return Ok(step),
@@ -554,6 +759,26 @@ async fn stream_chat(
             }
         }
     }
+}
+fn raw_frame(line: &[u8], split: &mut ThinkSplit) -> Result<Vec<u8>, String> {
+    if line.iter().all(u8::is_ascii_whitespace) {
+        return Ok(line.to_vec());
+    }
+    let mut frame: Value = serde_json::from_slice(line).map_err(|_| "Ollama trả khung JSON không hợp lệ")?;
+    let done = frame.get("done").and_then(Value::as_bool) == Some(true);
+    let (thought, answer) = split.push(frame["response"].as_str().unwrap_or_default(), done);
+    frame["message"] = json!({"role":"assistant","thinking":thought,"content":answer});
+    serde_json::to_vec(&frame).map_err(|e| e.to_string())
+}
+/// True for models whose chat format is ChatML with a <think> block (Qwen3 family, including
+/// Qwen GGUFs from Hugging Face), which lets a continuation resume the reasoning itself.
+async fn chatml_thinking(runtime: &Runtime, model: &str) -> bool {
+    let Ok(response) = runtime.client.post(format!("{OLLAMA}/api/show")).json(&json!({"model":model})).send().await else { return false };
+    let Ok(info) = response.json::<Value>().await else { return false };
+    let modelfile = info["modelfile"].as_str().unwrap_or_default();
+    let template = info["template"].as_str().unwrap_or_default();
+    modelfile.lines().any(|line| line.trim().to_lowercase().starts_with("renderer qwen3"))
+        || (template.contains("<|im_start|>") && template.contains("<think>"))
 }
 fn completed(content: &str) -> Result<(), String> {
     if content.trim().is_empty() {
@@ -670,7 +895,7 @@ fn consume(
             *metrics = Some(crate::storage::ChatMetrics {
                 thinking_tokens: Some(counts.thinking),
                 answer_tokens: Some(counts.answer),
-                thinking_capped: counts.thinking_capped,
+                output_limit: Some(counts.budget),
                 output_tokens: eval_count,
                 prompt_tokens: prompt_count,
                 eval_duration_ms: eval_duration.map(|d| d / 1_000_000),
@@ -710,45 +935,113 @@ fn consume(
 }
 
 #[cfg(test)]
+mod split_tests {
+    use super::ThinkSplit;
+    #[test]
+    fn splits_at_close_tag_across_chunks() {
+        let mut split = ThinkSplit::new(true);
+        let mut thought = String::new();
+        let mut answer = String::new();
+        for chunk in [" 3. Mía", "...</th", "ink>\n\nĐáp", " án<|im_end|>"] {
+            let (t, a) = split.push(chunk, false);
+            thought.push_str(&t);
+            answer.push_str(&a);
+        }
+        assert_eq!(thought, " 3. Mía...");
+        assert_eq!(answer, "Đáp án");
+        // Still thinking at the end of the stream: everything held back is thinking.
+        let mut open = ThinkSplit::new(true);
+        let (t1, _) = open.push("chưa xong </", false);
+        let (t2, a) = open.push("", true);
+        assert_eq!((format!("{t1}{t2}"), a), ("chưa xong </".to_string(), String::new()));
+        // Answer already started: output is answer only.
+        let (t, a) = ThinkSplit::new(false).push(" tiếp", false);
+        assert_eq!((t, a), (String::new(), " tiếp".to_string()));
+    }
+}
+#[cfg(test)]
 mod live_tests {
     use super::*;
-    use tauri::ipc::InvokeResponseBody;
 
-    /// Runs `generate` against the local Ollama. `cargo test --lib split_budgets -- --ignored --nocapture`
-    fn run_case(model: &str, think: usize, answer: usize, prompt: &str) {
+    #[test]
+    #[ignore]
+    fn truncate_then_continue() {
         let dir = std::env::temp_dir().join(format!("lim-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let runtime = Runtime::new(crate::storage::Store::open(&dir.join("t.sqlite3")).unwrap()).unwrap();
         let session = runtime.store.create_session().unwrap().id;
+        let model = "qwen3.5:2b";
+        let channel: Channel<Value> = Channel::new(|_| Ok(()));
+        let settings = InferenceSettings { num_predict: 48, ..Default::default() };
+        // A question the 2B model can finish; long essays make qwen3.5:2b think for 3.500+ tokens.
+        let prompt = "Thủ đô của Pháp là gì? Trả lời một câu.";
+        // 1) A tiny output limit stops the answer: status must be "truncated", not failed.
         let run = Uuid::new_v4().to_string();
         let (_, mut assistant) = runtime.store.begin(&session, &run, model, prompt).unwrap();
-        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
-        let sink = events.clone();
-        let channel: Channel<Value> = Channel::new(move |body| {
-            if let InvokeResponseBody::Json(raw) = body {
-                sink.lock().unwrap().push(serde_json::from_str(&raw).unwrap());
-            }
-            Ok(())
-        });
-        let settings = InferenceSettings { think_predict: think, num_predict: answer, ..Default::default() };
         let (mut sequence, mut content, mut thinking, mut metrics) = (0, String::new(), String::new(), None);
-        let result = tauri::async_runtime::block_on(generate(&runtime, &session, &run, model, prompt, 4096, &settings, &mut assistant, &channel, &mut sequence, &mut content, &mut thinking, &mut metrics));
-        let usage: Vec<Value> = events.lock().unwrap().iter().filter(|e| e["type"] == "usage").map(|e| e["usage"].clone()).collect();
-        println!("think={think} answer={answer} -> {:?}\n  thinking chars {} | answer chars {}\n  last usage {:?}\n  metrics {:?}\n  answer: {:?}",
-            result, thinking.len(), content.len(), usage.last(),
-            metrics.as_ref().map(|m: &crate::storage::ChatMetrics| (m.output_tokens, m.thinking_tokens, m.answer_tokens, m.thinking_capped)),
-            content.chars().take(160).collect::<String>());
+        let first = tauri::async_runtime::block_on(generate(&runtime, &session, &run, model, prompt, 4096, &settings, &mut assistant, &channel, &mut sequence, &mut content, &mut thinking, &mut metrics));
+        println!("first: {first:?} | thinking {} chars | answer {:?}", thinking.len(), content.chars().take(120).collect::<String>());
+        assert_eq!(first, Ok(true));
+        assistant.text = content.clone();
+        assistant.thinking = Some(thinking.clone()).filter(|t| !t.is_empty());
+        assistant.metrics = metrics.clone();
+        runtime.store.finish(&session, &assistant, "truncated", None).unwrap();
+        // 2) Continue with a fresh budget until the answer finishes (at most 15 rounds).
+        let mut finished = false;
+        for round in 1..=15 {
+            let run = Uuid::new_v4().to_string();
+            let mut assistant = runtime.store.begin_continue(&session, &run, &assistant.id, model).unwrap();
+            let before = assistant.text.clone();
+            let (mut content, mut thinking, mut metrics) = (assistant.text.clone(), assistant.thinking.clone().unwrap_or_default(), assistant.metrics.clone());
+            let more = InferenceSettings { num_predict: 400, ..Default::default() };
+            let result = tauri::async_runtime::block_on(continue_generate(&runtime, &session, &run, model, 4096, &more, &mut assistant, &channel, &mut sequence, &mut content, &mut thinking, &mut metrics));
+            println!("round {round}: {result:?} | +{} chars | tail {:?}", content.len() - before.len(), content.chars().rev().take(80).collect::<String>().chars().rev().collect::<String>());
+            assert!(content.starts_with(&before), "continuation must keep the earlier text");
+            let thinking_before = assistant.thinking.clone().unwrap_or_default();
+            if round == 1 && before.is_empty() {
+                assert!(thinking.len() > thinking_before.len(), "Qwen continuation should resume the reasoning");
+                println!("    thinking resumed: +{} chars, seam {:?}", thinking.len() - thinking_before.len(), format!("{}⟦+⟧{}", thinking_before.chars().rev().take(30).collect::<Vec<_>>().into_iter().rev().collect::<String>(), thinking[thinking_before.len()..].chars().take(40).collect::<String>()));
+            }
+            let seam: String = before.chars().rev().take(40).collect::<Vec<_>>().into_iter().rev().chain(["⟦+⟧".chars().collect::<Vec<_>>(), content[before.len()..].chars().take(50).collect()].concat()).collect();
+            println!("    seam: {seam:?}");
+            let limit = metrics.as_ref().and_then(|m| m.output_limit);
+            println!("    output limit {limit:?} · output tokens {:?}", metrics.as_ref().and_then(|m| m.output_tokens));
+            if round == 1 {
+                assert_eq!(limit, Some(48 + 400), "each continue adds its run's limit");
+            }
+            let truncated = result.clone().unwrap();
+            assistant.text = content;
+            assistant.thinking = Some(thinking).filter(|t| !t.is_empty());
+            assistant.metrics = metrics;
+            runtime.store.finish(&session, &assistant, if truncated { "truncated" } else { "completed" }, None).unwrap();
+            if !truncated { finished = true; break; }
+        }
+        assert!(finished, "answer should finish after continuing");
+        drop(runtime);
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    fn msg(role: &str, text: &str, status: &str) -> Message {
+        Message { id: Uuid::new_v4().to_string(), role: role.into(), text: text.into(), source: if role == "user" { "user".into() } else { "model".into() }, run_id: None, status: Some(status.into()), sources: None, model: None, thinking: None, metrics: None, error: None }
+    }
     #[test]
-    #[ignore]
-    fn split_budgets() {
-        let model = "qwen3.5:2b";
-        // Thinking capped early: phase 2 must still produce an answer with its own budget.
-        run_case(model, 64, 400, "Trước đó tôi đã nói gì?");
-        // Thinking off.
-        run_case(model, 0, 200, "Xin chào, bạn là ai?");
-        // Normal budgets.
-        run_case(model, 1024, 1024, "2 + 2 bằng mấy? Trả lời ngắn.");
+    fn drops_unanswered_questions() {
+        // Pháp answered, con bò stopped while thinking (empty), then "chào" with its running reply.
+        let history = vec![
+            msg("user", "viết về nước Pháp", "completed"),
+            msg("assistant", "Nước Pháp là…", "completed"),
+            msg("user", "viết về con bò", "completed"),
+            msg("assistant", "", "truncated"),
+            msg("user", "chào", "completed"),
+            msg("assistant", "", "running"),
+        ];
+        let roles: Vec<String> = bounded_history(history, 10_000).iter().map(|m| format!("{}:{}", m["role"].as_str().unwrap(), m["content"].as_str().unwrap())).collect();
+        assert_eq!(roles, ["user:viết về nước Pháp", "assistant:Nước Pháp là…", "user:chào"]);
+        // A cut answer that already has text stays, with its question.
+        let partial = vec![msg("user", "kể chuyện", "completed"), msg("assistant", "Ngày xưa", "truncated"), msg("user", "tiếp đi", "completed")];
+        assert_eq!(bounded_history(partial, 10_000).len(), 3);
     }
 }

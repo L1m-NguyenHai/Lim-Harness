@@ -8,7 +8,8 @@ export type ChatMetrics = {
   /** Streamed-chunk estimates per phase (≈ tokens). */
   thinkingTokens?: number;
   answerTokens?: number;
-  thinkingCapped?: boolean;
+  /** Output limit granted so far; grows by one run's limit on each "Tiếp tục". */
+  outputLimit?: number;
 };
 export type Message = {
   id: string;
@@ -16,7 +17,8 @@ export type Message = {
   text: string;
   source?: "user" | "model" | "ui_preview";
   runId?: string;
-  status?: "running" | "completed" | "cancelled" | "failed" | "interrupted";
+  /** "truncated": stopped at the output limit; can be continued. */
+  status?: "running" | "completed" | "truncated" | "cancelled" | "failed" | "interrupted";
   sources?: { path: string; title: string; excerpt: string }[];
   model?: string;
   thinking?: string;

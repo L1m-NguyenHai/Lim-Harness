@@ -239,3 +239,8 @@ kbd, code, pre { font-family: var(--font-mono); }
 .message .thinking-body p.bullet::before { content: ""; position: absolute; left: 2px; top: .7em; width: 4px; height: 4px; border-radius: 50%; background: var(--composer-border); }
 @keyframes thinking-pulse { 50% { box-shadow: 0 0 0 4px var(--accent-soft); } }
 @media (prefers-reduced-motion: reduce) { .thinking-steps > li.current .thinking-marker { animation: none; } }
+
+/* Answer stopped at the output limit */
+.message-truncated { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; margin-top: 8px; }
+.message-truncated .message-status { color: var(--ochre); }
+.message-truncated .secondary-button { display: inline-flex; align-items: center; gap: 6px; min-height: 28px; padding: 4px 11px; border-radius: 999px; }

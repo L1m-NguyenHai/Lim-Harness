@@ -16,12 +16,17 @@ assert.equal(measured.nextPromptTokens, 150 + 1);
 assert.equal(measured.includedMessages, 2);
 assert.equal(measured.droppedMessages, 0);
 
-// Oldest messages are dropped first once the byte budget is spent; previews and failed replies never count.
+// Oldest messages are dropped first once the byte budget is spent; previews, failed replies and
+// the questions they leave unanswered never count (mirrors runtime.rs conversation()).
 const long = 'x'.repeat(700);
-const crowded = [msg('user', long), msg('assistant', long), msg('user', 'preview', { source: 'ui_preview' }), msg('assistant', 'lỗi', { status: 'failed' }), msg('user', long)];
+const crowded = [msg('user', long), msg('assistant', long), msg('user', 'preview', { source: 'ui_preview' }), msg('user', 'hỏi lỗi'), msg('assistant', 'lỗi', { status: 'failed' }), msg('user', long), msg('assistant', long)];
 const cut = contextUsage(crowded, '', 4096, 2048, system);
 assert.equal(cut.includedMessages, 2);
-assert.equal(cut.droppedMessages, 1);
+assert.equal(cut.droppedMessages, 2);
+// A question whose answer stopped while thinking (empty) is left out, so the next draft does not
+// follow another user turn.
+const orphan = contextUsage([msg('user', 'viết về con bò'), msg('assistant', '', { status: 'truncated' })], 'chào', 4096, 2048, system);
+assert.equal(orphan.includedMessages + orphan.droppedMessages, 0);
 
 // A draft larger than the whole history budget is flagged.
 assert.equal(contextUsage([], 'y'.repeat(5000), 4096, 2048, system).draftFits, false);

@@ -14,13 +14,16 @@ const bodyLines = (lines: string[]) => lines
   .map((line) => /^[*\-+]\s+/.test(line) ? `• ${cleanInline(line.replace(/^[*\-+]\s+/, ""))}` : cleanInline(line));
 
 function fromSegment(lines: string[], marker: RegExp): ThinkingStep {
-  const head = lines[0].replace(marker, "").trim();
+  // A leading list number ("1.") is not a title; a number alone on its line uses the next line.
+  let head = lines[0].replace(marker, "").replace(/^\s*\d{1,2}[.)]\s*/, "").trim();
+  let rest = lines.slice(1);
+  if (!head && rest.length) { head = rest[0].trim(); rest = rest.slice(1); }
   const heading = head.match(/^\*\*(.+?)\*\*:?\s*(.*)$/);
-  if (heading) return { title: cleanInline(heading[1]).replace(/:$/, ""), body: bodyLines([heading[2], ...lines.slice(1)]) };
-  const text = [head, ...lines.slice(1)].join("\n");
-  const title = firstSentence(text);
-  const rest = cleanInline(text.replace(/\s+/g, " ")).slice(title.replace(/…$/, "").length).trim();
-  return { title, body: rest ? [rest] : [] };
+  if (heading) return { title: cleanInline(heading[1]).replace(/:$/, ""), body: bodyLines([heading[2], ...rest]) };
+  // Title from the first sentence of the first line; later lines keep their bullets.
+  const title = firstSentence(head);
+  const remainder = cleanInline(head.replace(/\s+/g, " ")).slice(title.replace(/…$/, "").length).trim();
+  return { title, body: [...(remainder ? [remainder] : []), ...bodyLines(rest)] };
 }
 
 /**
@@ -40,7 +43,7 @@ export function thinkingSteps(raw: string): ThinkingStep[] {
     starts.forEach((start, i) => steps.push(fromSegment(lines.slice(start, starts[i + 1] ?? lines.length), marker)));
     return steps;
   };
-  const numbered = /^\s{0,3}\d{1,2}[.)]\s+/;
+  const numbered = /^\s{0,3}\d{1,2}[.)](\s+|$)/;
   const heading = /^\s{0,3}(#{1,4}\s+|\*\*[^*]+\*\*:?\s*$)/;
   const steps = splitAt((line) => numbered.test(line), numbered)
     ?? splitAt((line) => heading.test(line), /^\s{0,3}#{1,4}\s+/);

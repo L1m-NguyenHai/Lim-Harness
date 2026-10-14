@@ -14,7 +14,7 @@ export function InferencePanel({ sessionTitle, open, settings, contextSize, read
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   useEffect(() => { setDraft(settings); }, [settings]);
-  const invalidNumbers = [draft.temperature, draft.topP, draft.topK, draft.repeatPenalty, draft.numPredict, draft.thinkPredict].some((value) => !Number.isFinite(value));
+  const invalidNumbers = [draft.temperature, draft.topP, draft.topK, draft.repeatPenalty, draft.numPredict].some((value) => !Number.isFinite(value));
   const dirty = JSON.stringify(draft) !== JSON.stringify(settings) || draftContext !== contextSize;
   useEffect(() => { onDirty(dirty); }, [dirty, onDirty]);
   useEffect(() => {
@@ -25,14 +25,13 @@ export function InferencePanel({ sessionTitle, open, settings, contextSize, read
     if (pendingApplyContext.current === contextSize) pendingApplyContext.current = null;
   }, [contextSize]);
   const promptBytes = new TextEncoder().encode(draft.systemPrompt).length;
-  const budget = draftContext - draft.numPredict - draft.thinkPredict - promptBytes - 256;
-  const controls: { key: "temperature" | "topP" | "topK" | "repeatPenalty" | "numPredict" | "thinkPredict"; label: string; min: number; max: number; step: number; hint: string }[] = [
+  const budget = draftContext - draft.numPredict - promptBytes - 256;
+  const controls: { key: "temperature" | "topP" | "topK" | "repeatPenalty" | "numPredict"; label: string; min: number; max: number; step: number; hint: string }[] = [
     { key: "temperature", label: "Temperature", min: 0, max: 2, step: 0.05, hint: "Thấp: tập trung · Cao: đa dạng" },
     { key: "topP", label: "Top P", min: 0, max: 1, step: 0.05, hint: "Ngưỡng xác suất lấy mẫu" },
     { key: "topK", label: "Top K", min: 0, max: 100, step: 1, hint: "Số ứng viên token · 0 để tắt" },
     { key: "repeatPenalty", label: "Repeat penalty", min: 0, max: 2, step: 0.05, hint: "1: không phạt lặp" },
-    { key: "thinkPredict", label: "Giới hạn suy nghĩ", min: 0, max: 8192, step: 1, hint: "Token tối đa cho phần suy nghĩ · 0 để tắt. Hết giới hạn: dừng suy nghĩ rồi trả lời" },
-    { key: "numPredict", label: "Giới hạn trả lời", min: 128, max: 8192, step: 1, hint: "Token tối đa cho câu trả lời, không tính suy nghĩ" },
+    { key: "numPredict", label: "Giới hạn output", min: 128, max: 8192, step: 1, hint: "Token tối đa mỗi lượt, gồm cả suy nghĩ và trả lời. Hết giới hạn: bấm Tiếp tục để viết tiếp" },
   ];
   async function save(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault(); setError(""); setSaving(true);
@@ -47,7 +46,7 @@ export function InferencePanel({ sessionTitle, open, settings, contextSize, read
       <fieldset className="inference-fields" disabled={!ready || saving}>
         <section className="inference-section"><h3>Inference</h3>
           <label className="inference-control" htmlFor="inference-context"><span>Context window</span><select id="inference-context" value={draftContext} onChange={(event) => setDraftContext(Number(event.target.value))}><option value={4096}>4 096 token</option><option value={8192}>8 192 token</option><option value={16384}>16 384 token</option></select><small>Tăng sẽ dùng thêm bộ nhớ</small></label>
-          {controls.map(({ key, label, min, max, step, hint }) => <div className="inference-control" key={key}><div className="inference-control-top"><label htmlFor={`inference-${key}`}>{label}</label><input id={`inference-${key}`} type="number" min={min} max={max} step={key === "topK" || key === "numPredict" || key === "thinkPredict" ? 1 : "any"} required value={Number.isFinite(draft[key]) ? draft[key] : ""} onChange={(event) => setDraft({ ...draft, [key]: event.target.valueAsNumber })} /></div>{key !== "numPredict" && key !== "thinkPredict" && <input type="range" aria-label={`${label} slider`} min={min} max={max} step={step} value={draft[key]} onChange={(event) => setDraft({ ...draft, [key]: Number(event.target.value) })} />}<small>{hint}</small></div>)}
+          {controls.map(({ key, label, min, max, step, hint }) => <div className="inference-control" key={key}><div className="inference-control-top"><label htmlFor={`inference-${key}`}>{label}</label><input id={`inference-${key}`} type="number" min={min} max={max} step={key === "topK" || key === "numPredict" ? 1 : "any"} required value={Number.isFinite(draft[key]) ? draft[key] : ""} onChange={(event) => setDraft({ ...draft, [key]: event.target.valueAsNumber })} /></div>{key !== "numPredict" && <input type="range" aria-label={`${label} slider`} min={min} max={max} step={step} value={draft[key]} onChange={(event) => setDraft({ ...draft, [key]: Number(event.target.value) })} />}<small>{hint}</small></div>)}
           <label className="inference-control" htmlFor="inference-seed"><span>Seed</span><input id="inference-seed" type="number" min={0} max={2147483647} step={1} placeholder="Mặc định của model" value={draft.seed ?? ""} onChange={(event) => setDraft({ ...draft, seed: event.target.value === "" ? null : event.target.valueAsNumber })} /><small>Để trống để dùng mặc định của model</small></label>
         </section>
         <section className="inference-section"><h3>System prompt</h3><label className="sr-only" htmlFor="inference-system">Chỉ dẫn hệ thống cho model</label><textarea id="inference-system" rows={7} value={draft.systemPrompt} onChange={(event) => setDraft({ ...draft, systemPrompt: event.target.value })} placeholder="Chỉ dẫn về vai trò, cách trả lời…" /><small>Áp dụng cho phiên này từ lượt gửi tiếp theo.</small></section>

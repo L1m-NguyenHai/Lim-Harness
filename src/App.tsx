@@ -4,7 +4,7 @@ import Cookbook from "./Cookbook";
 import FloatingWindow from "./FloatingWindow";
 import type { WindowMode } from "./FloatingWindow";
 import { core, native, defaultInference } from "./core";
-import type { InferenceSettings, RunUsage } from "./core";
+import type { InferenceSettings, RunEvent, RunUsage } from "./core";
 import { InferencePanel } from "./InferencePanel";
 import { ContextMeter } from "./ContextMeter";
 import { ThinkingSteps } from "./ThinkingSteps";
@@ -35,6 +35,7 @@ import {
   Copy,
   Square,
   Trash2,
+  Play,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { moduleCatalog, newSession, readState, STORAGE_KEY } from "./state";
@@ -77,23 +78,28 @@ function liveUsage(meta: { startedAt: number; chars: number; usage?: RunUsage })
   const u = meta.usage;
   const seconds = (Date.now() - meta.startedAt) / 1000;
   const parts: string[] = [];
-  if (u && u.thinkingBudget > 0) parts.push(`Suy nghĩ ~${u.thinkingTokens}/${u.thinkingBudget}${u.thinkingCapped ? " (đã dừng)" : ""}`);
-  if (u) parts.push(`Trả lời ~${u.answerTokens}/${u.answerBudget} token`);
+  if (u) parts.push(`~${(u.thinkingTokens + u.answerTokens).toLocaleString("vi-VN")}/${u.budget.toLocaleString("vi-VN")} token`);
   const total = u ? u.thinkingTokens + u.answerTokens : meta.chars / 4;
   if (seconds > 0.5 && total > 0) parts.push(`${(total / seconds).toFixed(1)} token/s`);
-  return parts.length ? `${parts.join(" · ")} · ước tính…` : "Đang chạy…";
+  const phase = u && u.answerTokens > 0 ? "đang trả lời" : u && u.thinkingTokens > 0 ? "đang suy nghĩ" : "đang chạy";
+  return parts.length ? `${parts.join(" · ")} · ${phase}…` : "Đang chạy…";
 }
-function formatMetrics(m?: import("./state").ChatMetrics): string {
+// One output limit: show Ollama's real total against it; the thinking/answer split is an estimate.
+function formatMetrics(m: import("./state").ChatMetrics | undefined, limit: number): string {
   if (!m) return "";
   const parts: string[] = [];
+  // The limit is cumulative: each "Tiếp tục" adds one run's limit to the answer.
+  const granted = m.outputLimit ?? limit;
+  if (m.outputTokens != null) parts.push(`${m.outputTokens.toLocaleString("vi-VN")}/${granted.toLocaleString("vi-VN")} token`);
   if (m.tokensPerSecond != null && Number.isFinite(m.tokensPerSecond))
     parts.push(`${m.tokensPerSecond.toFixed(1)} token/s`);
-  if (m.thinkingTokens) parts.push(`suy nghĩ ~${m.thinkingTokens}${m.thinkingCapped ? " (chạm giới hạn)" : ""}`);
-  if (m.answerTokens != null && m.thinkingTokens) parts.push(`trả lời ~${m.answerTokens}`);
-  if (m.outputTokens != null) parts.push(`${m.outputTokens} token`);
   const ms = m.totalDurationMs ?? m.evalDurationMs;
   if (ms != null) parts.push(ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`);
   return parts.join(" · ");
+}
+function metricsDetail(m?: import("./state").ChatMetrics): string {
+  if (!m?.thinkingTokens && !m?.answerTokens) return "";
+  return `Ước tính: suy nghĩ ~${m.thinkingTokens ?? 0}, trả lời ~${m.answerTokens ?? 0} token (đếm theo khung stream, thường thấp hơn tổng Ollama báo).`;
 }
 
 export default function App() {
@@ -151,7 +157,11 @@ export default function App() {
   const selectedModules = state.preferences.modules.length;
   // Run settings of the open session; everything in the panel follows the selected session.
   // Merged over full values so configs saved by older versions (only some fields) stay complete.
-  const effective: SessionConfig = { ...inferenceSettings, contextSize, ...session.config };
+  // Configs from the build with separate thinking/answer limits fold thinkPredict into numPredict
+  // (as the backend does) and drop it, so it is never sent back and counted twice.
+  const { thinkPredict: legacyThink = 0, ...savedConfig } = (session.config ?? {}) as Partial<SessionConfig> & { thinkPredict?: number };
+  const effective: SessionConfig = { ...inferenceSettings, contextSize, ...savedConfig };
+  if (legacyThink > 0) effective.numPredict = Math.min(8192, effective.numPredict + legacyThink);
   const effectiveKey = JSON.stringify(effective);
   // Keyed by value so a refreshed snapshot with identical settings does not reset the panel draft.
   const panelSettings = useMemo<InferenceSettings>(() => { const { contextSize: _context, ...settings } = JSON.parse(effectiveKey) as SessionConfig; return settings; }, [effectiveKey]);
@@ -390,6 +400,11 @@ export default function App() {
           : s,
       ),
     }));
+    await streamRun(sessionId, assistantId, userId, (receive) => core.start(sessionId, text, state.preferences.model, receive));
+  }
+  // Shared by send and continue: applies run events to the session's messages and
+  // reloads the authoritative transcript when the run ends.
+  async function streamRun(sessionId: string, assistantId: string, userId: string | null, start: (receive: (event: RunEvent) => void) => Promise<string>) {
     let sequence = -1;
     let ended = false;
     let currentAssistantId: string = assistantId;
@@ -400,10 +415,10 @@ export default function App() {
       setStreamMeta((c) => { const next = { ...c }; delete next[sessionId]; return next; });
     };
     try {
-      await core.start(sessionId, text, state.preferences.model, (event) => {
+      await start((event) => {
         if (ended || event.sessionId !== sessionId || event.sequence <= sequence) return;
         sequence = event.sequence;
-        if (event.type === "started" && activeSession.current === sessionId) { setDraft(""); setAttachment(null); }
+        if (event.type === "started" && userId && activeSession.current === sessionId) { setDraft(""); setAttachment(null); }
         if (event.type === "started") setStreamMeta((c) => ({ ...c, [sessionId]: { startedAt: Date.now(), chars: 0 } }));
         if (event.type === "usage" && event.usage) { const usage = event.usage; setStreamMeta((c) => ({ ...c, [sessionId]: { startedAt: c[sessionId]?.startedAt ?? Date.now(), chars: c[sessionId]?.chars ?? 0, usage } })); }
         if (event.type === "text_delta") setStreamMeta((c) => ({ ...c, [sessionId]: { startedAt: c[sessionId]?.startedAt ?? Date.now(), chars: (c[sessionId]?.chars ?? 0) + (event.delta ?? "").length, usage: c[sessionId]?.usage } }));
@@ -413,21 +428,21 @@ export default function App() {
         if (event.message) currentAssistantId = event.message.id;
         setState((c) => ({ ...c, sessions: c.sessions.map((s) => s.id !== sessionId ? s : {
           ...s, messages: s.messages.map((m) => {
-            if (m.id === userId && event.userMessage) return event.userMessage;
+            if (userId && m.id === userId && event.userMessage) return event.userMessage;
             if (m.id !== previousId) return m;
             const base = { ...m, runId: event.runId, ...(event.message ?? {}) };
             if (event.type === "text_delta") base.text = m.text + (event.delta ?? "");
             if (event.type === "thinking_delta") base.thinking = (m.thinking ?? "") + (event.delta ?? "");
             if (event.type === "metrics" && event.metrics) base.metrics = event.metrics;
             if (event.sources) base.sources = event.sources;
-            if (["completed", "cancelled", "failed"].includes(event.type))
-              base.status = event.type as "completed" | "cancelled" | "failed";
+            if (["completed", "truncated", "cancelled", "failed"].includes(event.type))
+              base.status = event.type as "completed" | "truncated" | "cancelled" | "failed";
             if (event.type === "failed" && event.error) base.error = event.error;
             return base;
           }),
         }) }));
         if (event.error) setRuntimeError(event.error);
-        if (["completed", "cancelled", "failed"].includes(event.type)) {
+        if (["completed", "truncated", "cancelled", "failed"].includes(event.type)) {
           ended = true;
           setStreamMeta((c) => { const next = { ...c }; delete next[sessionId]; return next; });
           // Native transcript is authoritative, including IDs and partial/error status.
@@ -443,6 +458,17 @@ export default function App() {
         setState((c) => ({ ...c, sessions: c.sessions.map((s) => s.id === sessionId ? snapshot.sessions.find((n) => n.id === sessionId) ?? s : s) }));
       } catch (loadError) { setRuntimeError(`${String(error)} · ${String(loadError)}`); }
     }
+  }
+  async function continueAnswer(messageId: string) {
+    const sessionId = session.id;
+    if (!ready || !native || runLock.current.has(sessionId)) return;
+    const model = session.messages.find((m) => m.id === messageId)?.model || state.preferences.model;
+    if (!model) { setPage("settings"); setModelError("Chọn một model Ollama trước khi tiếp tục."); return; }
+    runLock.current.add(sessionId);
+    setRunning((c) => ({ ...c, [sessionId]: "starting" }));
+    setRuntimeError("");
+    setState((c) => ({ ...c, sessions: c.sessions.map((s) => s.id !== sessionId ? s : { ...s, messages: s.messages.map((m) => m.id === messageId ? { ...m, status: "running" as const, error: undefined } : m) }) }));
+    await streamRun(sessionId, messageId, null, (receive) => core.continueTurn(sessionId, messageId, model, receive));
   }
   async function stop() {
     const runId = running[session.id];
@@ -651,7 +677,7 @@ export default function App() {
           {(
             <header className="topbar">
               <span className="session-title">{session.title}</span>
-              <div className="runtime-hud" aria-label="Cấu hình model hiện tại"><span className="hud-model" title={state.preferences.model}>{state.preferences.model || "Ollama · chưa chọn model"}</span><span className="hud-temperature">temp={effective.temperature.toFixed(2)}</span><ContextMeter usage={contextUsage(session.messages, draft, effective.contextSize, effective.numPredict + effective.thinkPredict, effective.systemPrompt)} memory={Boolean(vaultPath)} /></div>
+              <div className="runtime-hud" aria-label="Cấu hình model hiện tại"><span className="hud-model" title={state.preferences.model}>{state.preferences.model || "Ollama · chưa chọn model"}</span><span className="hud-temperature">temp={effective.temperature.toFixed(2)}</span><ContextMeter usage={contextUsage(session.messages, draft, effective.contextSize, effective.numPredict, effective.systemPrompt)} memory={Boolean(vaultPath)} /></div>
               <button className={`icon-button inference-toggle ${inferenceDirty ? "has-draft" : ""}`} aria-label={inferenceDirty ? "Tham số chạy model · có thay đổi chưa áp dụng" : "Tham số chạy model"} title="Tham số chạy model" aria-expanded={inferenceOpen} aria-controls="inference-heading" onClick={() => setInferenceOpen((open) => !open)}><Settings2 size={17} /></button>
             </header>
           )}
@@ -727,7 +753,7 @@ export default function App() {
                                 const steps = thinkingSteps(thinking);
                                 const live = isRunning && !answer.trim();
                                 return <details className="message-thinking" open={live}>
-                                  <summary>{live ? `Đang suy nghĩ · bước ${steps.length}` : "Quá trình suy nghĩ"}<span className="thinking-count">{steps.length} bước{m.metrics?.thinkingTokens ? ` · ~${m.metrics.thinkingTokens} token` : ""}{m.metrics?.thinkingCapped ? " · chạm giới hạn" : ""}</span></summary>
+                                  <summary>{live ? `Đang suy nghĩ · bước ${steps.length}` : "Quá trình suy nghĩ"}<span className="thinking-count">{steps.length} bước{m.metrics?.thinkingTokens ? ` · ~${m.metrics.thinkingTokens} token` : ""}</span></summary>
                                   <ThinkingSteps steps={steps} live={live} />
                                 </details>;
                               })()
@@ -736,9 +762,11 @@ export default function App() {
                               <p>{answer || (isRunning ? "Đang chờ model…" : "Không có nội dung trả lời.")}</p>
                             </div>
                             {m.source === "ui_preview" && <small className="message-status">Thông báo từ bản UI thử</small>}
-                            {m.status && m.status !== "completed" && !isUser && <small className="message-status">{{ running: liveSpeed || "Đang trả lời", cancelled: "Đã dừng · câu trả lời chưa hoàn tất", failed: m.error ? `Lượt chạy bị lỗi: ${m.error}` : "Lượt chạy bị lỗi", interrupted: "Bị gián đoạn khi đóng ứng dụng" }[m.status]}</small>}
-                            {!isUser && m.metrics && m.status === "completed" && formatMetrics(m.metrics) && (
-                              <small className="message-metrics">{formatMetrics(m.metrics)}</small>
+                            {m.status === "truncated" && !isUser && <div className="message-truncated"><small className="message-status">Đã dừng vì hết {(m.metrics?.outputLimit ?? effective.numPredict).toLocaleString("vi-VN")} token output{answer.trim() ? "" : " khi đang suy nghĩ"}.</small>{/* Only the newest answer can be continued; after a new question the old one stays as is. */}
+                              {m.id === session.messages[session.messages.length - 1]?.id && <button className="secondary-button" disabled={!ready || !native || Boolean(running[session.id])} title={native ? "Viết tiếp câu trả lời với giới hạn output mới" : "Mở app desktop để tiếp tục"} onClick={() => void continueAnswer(m.id)}><Play size={13} aria-hidden="true" />Tiếp tục (+{effective.numPredict.toLocaleString("vi-VN")} token)</button>}</div>}
+                            {m.status && m.status !== "completed" && m.status !== "truncated" && !isUser && <small className="message-status">{{ running: liveSpeed || "Đang trả lời", cancelled: "Đã dừng · câu trả lời chưa hoàn tất", failed: m.error ? `Lượt chạy bị lỗi: ${m.error}` : "Lượt chạy bị lỗi", interrupted: "Bị gián đoạn khi đóng ứng dụng" }[m.status]}</small>}
+                            {!isUser && m.metrics && (m.status === "completed" || m.status === "truncated") && formatMetrics(m.metrics, effective.numPredict) && (
+                              <small className="message-metrics" title={metricsDetail(m.metrics)}>{formatMetrics(m.metrics, effective.numPredict)}</small>
                             )}
                             {!!m.sources?.length && <details className="message-sources"><summary>Nguồn ghi chú ({m.sources.length})</summary>{m.sources.map((source, i) => <div key={source.path}><strong>[vault:{i + 1}] {source.title}</strong><small>{source.path}</small><p>{source.excerpt}</p></div>)}</details>}
                             <button
