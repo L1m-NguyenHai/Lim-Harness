@@ -28,12 +28,14 @@ export type CatalogModel = {
   maxContext?: number;
   digest?: string;
   metadataStatus?: "verified" | "partial";
+  provider?: "ollama" | "huggingface";
+  downloads?: number;
 };
 
 export type CatalogSnapshot = {
   models: CatalogModel[];
   updatedAt: string;
-  source: "online" | "cache" | "bundled";
+  source: "online" | "cache" | "bundled" | "search";
   warnings: string[];
 };
 

@@ -22,6 +22,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             runtime::get_snapshot,
             runtime::create_session,
+            runtime::delete_session,
+            runtime::set_session_config,
             runtime::import_sessions,
             runtime::set_model,
             runtime::set_inference_settings,
@@ -30,12 +32,14 @@ pub fn run() {
             runtime::search_memory,
             runtime::list_models,
             runtime::start_turn,
+            runtime::continue_turn,
             runtime::cancel_turn,
             cookbook::cookbook_snapshot,
             cookbook::start_model_setup,
             cookbook::cancel_model_setup,
             cookbook::unload_model,
-            catalog::get_model_catalog
+            catalog::get_model_catalog,
+            catalog::search_model_catalog
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Lim Harness");

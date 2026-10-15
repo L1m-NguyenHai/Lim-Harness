@@ -5,6 +5,11 @@ export type ChatMetrics = {
   evalDurationMs?: number;
   totalDurationMs?: number;
   tokensPerSecond?: number;
+  /** Streamed-chunk estimates per phase (≈ tokens). */
+  thinkingTokens?: number;
+  answerTokens?: number;
+  /** Output limit granted so far; grows by one run's limit on each "Tiếp tục". */
+  outputLimit?: number;
 };
 export type Message = {
   id: string;
@@ -12,17 +17,22 @@ export type Message = {
   text: string;
   source?: "user" | "model" | "ui_preview";
   runId?: string;
-  status?: "running" | "completed" | "cancelled" | "failed" | "interrupted";
+  /** "truncated": stopped at the output limit; can be continued. */
+  status?: "running" | "completed" | "truncated" | "cancelled" | "failed" | "interrupted";
   sources?: { path: string; title: string; excerpt: string }[];
   model?: string;
   thinking?: string;
   metrics?: ChatMetrics;
+  error?: string;
 };
+/** All run settings of one session: context window plus every inference parameter. */
+export type SessionConfig = import("./core").InferenceSettings & { contextSize: number };
 export type Session = {
   id: string;
   title: string;
   created: string;
   messages: Message[];
+  config?: SessionConfig;
 };
 export type Note = {
   id: string;
