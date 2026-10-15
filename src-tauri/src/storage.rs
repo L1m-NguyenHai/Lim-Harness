@@ -17,13 +17,16 @@ fn check_window(context_size: usize, settings: &InferenceSettings) -> Result<(),
     if ![4096, 8192, 16384].contains(&context_size) {
         return Err("Context phải là 4096, 8192 hoặc 16384.".into());
     }
-    if context_size.saturating_sub(settings.output_reserve() + settings.system_prompt.len() + 256) < 64 {
+    if context_size.saturating_sub(settings.output_reserve() + settings.system_prompt.len() + 256)
+        < 64
+    {
         return Err("Cấu hình phải còn ít nhất 64 byte UTF-8 cho context đầu vào sau khi dành suy nghĩ, trả lời, system prompt và framing. Giảm giới hạn/system prompt hoặc tăng context.".into());
     }
     Ok(())
 }
 // Kept short: rules for Obsidian notes travel with the notes (vault::memory_context).
-pub const DEFAULT_SYSTEM_PROMPT:&str="Bạn là Lim, trợ lý AI chạy trên máy của người dùng. Mặc định trả lời bằng tiếng Việt, tự nhiên và ngắn gọn. Bạn chỉ trò chuyện bằng văn bản, không chạy lệnh và không đọc hay sửa tệp.";
+pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
+const LEGACY_SYSTEM_PROMPT: &str = "Bạn là Lim, trợ lý AI chạy trên máy của người dùng. Mặc định trả lời bằng tiếng Việt, tự nhiên và ngắn gọn. Bạn chỉ trò chuyện bằng văn bản, không chạy lệnh và không đọc hay sửa tệp.";
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct InferenceSettings {
@@ -59,6 +62,9 @@ impl InferenceSettings {
         self.num_predict
     }
     fn normalize(&mut self) {
+        if self.system_prompt == LEGACY_SYSTEM_PROMPT {
+            self.system_prompt = DEFAULT_SYSTEM_PROMPT.into();
+        }
         if self.legacy_think_predict > 0 {
             self.num_predict = (self.num_predict + self.legacy_think_predict).min(8192);
             self.legacy_think_predict = 0;
@@ -166,6 +172,27 @@ pub struct Snapshot {
 pub struct Store {
     connection: Mutex<Connection>,
 }
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryJob {
+    pub id: String,
+    pub session_id: String,
+    pub model: String,
+    pub vault: String,
+    pub generation: String,
+    pub context_size: usize,
+    pub messages: Vec<Message>,
+    pub status: String,
+    pub error: Option<String>,
+    pub changed_count: usize,
+    pub created_at: String,
+    #[serde(default)]
+    pub plan: Option<serde_json::Value>,
+    #[serde(default)]
+    pub baseline: std::collections::BTreeMap<String, (String, String)>,
+    #[serde(default)]
+    pub baseline_error: Option<String>,
+}
 impl Store {
     pub fn open(path: &Path) -> Result<Self, String> {
         let connection = Connection::open(path).map_err(|e| e.to_string())?;
@@ -175,7 +202,15 @@ impl Store {
           CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),model TEXT NOT NULL,status TEXT NOT NULL,started TEXT NOT NULL,ended TEXT,error TEXT);
           CREATE UNIQUE INDEX IF NOT EXISTS one_running_session ON runs(session_id) WHERE status='running';
           CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),run_id TEXT REFERENCES runs(id),role TEXT NOT NULL,text TEXT NOT NULL,source TEXT NOT NULL,status TEXT,created TEXT NOT NULL,position INTEGER NOT NULL,sources TEXT,model TEXT,thinking TEXT NOT NULL DEFAULT '',metrics TEXT);
-          CREATE INDEX IF NOT EXISTS ordered_messages ON messages(session_id,position);").map_err(|e| e.to_string())?;
+          CREATE INDEX IF NOT EXISTS ordered_messages ON messages(session_id,position);
+          CREATE TABLE IF NOT EXISTS memory_jobs(id TEXT PRIMARY KEY,payload TEXT NOT NULL,status TEXT NOT NULL,error TEXT,changed_count INTEGER NOT NULL DEFAULT 0);
+          CREATE TABLE IF NOT EXISTS memory_turn_targets(message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,target TEXT NOT NULL);").map_err(|e| e.to_string())?;
+        connection
+            .execute(
+                "UPDATE memory_jobs SET status='pending',error=NULL WHERE status='running'",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
         for migration in [
             "ALTER TABLE messages ADD COLUMN model TEXT",
             "ALTER TABLE messages ADD COLUMN thinking TEXT NOT NULL DEFAULT ''",
@@ -227,7 +262,9 @@ impl Store {
         let sessions = {
             let db = self.db()?;
             let mut stmt = db
-                .prepare("SELECT id,title,created,config FROM sessions ORDER BY updated DESC,rowid DESC")
+                .prepare(
+                    "SELECT id,title,created,config FROM sessions ORDER BY updated DESC,rowid DESC",
+                )
                 .map_err(|e| e.to_string())?;
             let rows = stmt
                 .query_map([], |r| {
@@ -248,8 +285,13 @@ impl Store {
         for mut session in sessions {
             session.messages = self.messages(&session.id)?;
             // A damaged session config must not block loading the app; show global values instead.
-            let (context_size, settings) = self.session_config(&session.id).or_else(|_| self.inference_config())?;
-            session.config = Some(SessionConfig { context_size, settings });
+            let (context_size, settings) = self
+                .session_config(&session.id)
+                .or_else(|_| self.inference_config())?;
+            session.config = Some(SessionConfig {
+                context_size,
+                settings,
+            });
             populated.push(session);
         }
         let (context_size, inference_settings) = self.inference_config()?;
@@ -345,7 +387,10 @@ impl Store {
     }
     pub fn create_session(&self) -> Result<Session, String> {
         // Each new session starts from the built-in defaults, independent of other sessions.
-        let config = SessionConfig { context_size: 4096, settings: InferenceSettings::default() };
+        let config = SessionConfig {
+            context_size: 4096,
+            settings: InferenceSettings::default(),
+        };
         let session = Session {
             id: Uuid::new_v4().to_string(),
             title: "Phiên mới".into(),
@@ -368,18 +413,26 @@ impl Store {
         let (context_size, settings) = self.inference_config()?;
         let raw: Option<String> = self
             .db()?
-            .query_row("SELECT config FROM sessions WHERE id=?1", [session], |r| r.get(0))
+            .query_row("SELECT config FROM sessions WHERE id=?1", [session], |r| {
+                r.get(0)
+            })
             .map_err(|_| "Không tìm thấy phiên".to_string())?;
-        let Some(stored) = raw.and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok()) else {
+        let Some(stored) = raw.and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        else {
             return Ok((context_size, settings));
         };
-        let mut merged = serde_json::to_value(SessionConfig { context_size, settings }).map_err(|e| e.to_string())?;
+        let mut merged = serde_json::to_value(SessionConfig {
+            context_size,
+            settings,
+        })
+        .map_err(|e| e.to_string())?;
         if let (Some(target), Some(fields)) = (merged.as_object_mut(), stored.as_object()) {
             for (key, value) in fields {
                 target.insert(key.clone(), value.clone());
             }
         }
-        let mut config: SessionConfig = serde_json::from_value(merged).map_err(|_| "Cấu hình của phiên không hợp lệ; cần lưu lại.")?;
+        let mut config: SessionConfig = serde_json::from_value(merged)
+            .map_err(|_| "Cấu hình của phiên không hợp lệ; cần lưu lại.")?;
         config.settings.normalize();
         config.settings.validate()?;
         Ok((config.context_size, config.settings))
@@ -393,7 +446,10 @@ impl Store {
         let encoded = serde_json::to_string(config).map_err(|e| e.to_string())?;
         let changed = self
             .db()?
-            .execute("UPDATE sessions SET config=?2 WHERE id=?1", params![session, encoded])
+            .execute(
+                "UPDATE sessions SET config=?2 WHERE id=?1",
+                params![session, encoded],
+            )
             .map_err(|e| e.to_string())?;
         if changed == 0 {
             return Err("Không tìm thấy phiên".into());
@@ -405,12 +461,17 @@ impl Store {
         let mut db = self.db()?;
         let tx = db.transaction().map_err(|e| e.to_string())?;
         let running: i64 = tx
-            .query_row("SELECT COUNT(*) FROM runs WHERE session_id=?1 AND status='running'", [session], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM runs WHERE session_id=?1 AND status='running'",
+                [session],
+                |r| r.get(0),
+            )
             .map_err(|e| e.to_string())?;
         if running > 0 {
             return Err("Phiên đang có lượt chạy; dừng trả lời trước khi xoá.".into());
         }
         for sql in [
+            "DELETE FROM memory_jobs WHERE json_extract(payload,'$.sessionId')=?1",
             "DELETE FROM messages WHERE session_id=?1",
             "DELETE FROM runs WHERE session_id=?1",
             "DELETE FROM sessions WHERE id=?1",
@@ -418,6 +479,15 @@ impl Store {
             tx.execute(sql, [session]).map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())
+    }
+    pub fn session_exists(&self, session: &str) -> Result<bool, String> {
+        self.db()?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)",
+                [session],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())
     }
     pub fn import_sessions(&self, sessions: Vec<Session>) -> Result<(), String> {
         if sessions.len() > 1000 {
@@ -461,12 +531,23 @@ impl Store {
         }
         tx.commit().map_err(|e| e.to_string())
     }
+    #[cfg(test)]
     pub fn begin(
         &self,
         session: &str,
         run: &str,
         model: &str,
         text: &str,
+    ) -> Result<(Message, Message), String> {
+        self.begin_with_memory_target(session, run, model, text, None)
+    }
+    pub fn begin_with_memory_target(
+        &self,
+        session: &str,
+        run: &str,
+        model: &str,
+        text: &str,
+        target: Option<&(String, String)>,
     ) -> Result<(Message, Message), String> {
         let mut db = self.db()?;
         let tx = db.transaction().map_err(|e| e.to_string())?;
@@ -522,9 +603,31 @@ impl Store {
         for (offset, message) in [&user, &assistant].iter().enumerate() {
             tx.execute("INSERT INTO messages(id,session_id,run_id,role,text,source,status,created,position,model,thinking) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'')",params![message.id,session,run,message.role,message.text,message.source,message.status,timestamp,position+offset as i64,message.model]).map_err(|e|e.to_string())?;
         }
+        tx.execute(
+            "INSERT INTO memory_turn_targets(message_id,target) VALUES(?1,?2)",
+            params![
+                assistant.id,
+                serde_json::to_string(&target).map_err(|e| e.to_string())?
+            ],
+        )
+        .map_err(|e| e.to_string())?;
         tx.execute("UPDATE sessions SET title=CASE WHEN ?2=0 THEN ?3 ELSE title END,updated=?4 WHERE id=?1",params![session,position,text.chars().take(48).collect::<String>(),timestamp]).map_err(|e|e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok((user, assistant))
+    }
+    pub fn memory_turn_target(&self, message_id: &str) -> Result<Option<(String, String)>, String> {
+        let raw: Option<String> = self
+            .db()?
+            .query_row(
+                "SELECT target FROM memory_turn_targets WHERE message_id=?1",
+                [message_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        raw.map(|raw| serde_json::from_str(&raw).map_err(|e| e.to_string()))
+            .transpose()
+            .map(Option::flatten)
     }
     pub fn checkpoint(&self, id: &str, text: &str, thinking: &str) -> Result<(), String> {
         self.db()?
@@ -546,7 +649,13 @@ impl Store {
             .map_err(|e| e.to_string())
     }
     /// Reopens an answer that stopped at the output limit so a new run can continue it.
-    pub fn begin_continue(&self, session: &str, run: &str, message_id: &str, model: &str) -> Result<Message, String> {
+    pub fn begin_continue(
+        &self,
+        session: &str,
+        run: &str,
+        message_id: &str,
+        model: &str,
+    ) -> Result<Message, String> {
         {
             let mut db = self.db()?;
             let tx = db.transaction().map_err(|e| e.to_string())?;
@@ -568,15 +677,20 @@ impl Store {
                 )
                 .map_err(|e| e.to_string())?;
             if newer {
-                return Err("Đã có tin nhắn mới hơn; chỉ tiếp tục được câu trả lời mới nhất.".into());
+                return Err(
+                    "Đã có tin nhắn mới hơn; chỉ tiếp tục được câu trả lời mới nhất.".into(),
+                );
             }
             tx.execute(
                 "INSERT INTO runs(id,session_id,model,status,started) VALUES(?1,?2,?3,'running',?4)",
                 params![run, session, model, now()],
             )
             .map_err(|_| "Phiên này đang có một lượt chạy".to_string())?;
-            tx.execute("UPDATE messages SET status='running',run_id=?2 WHERE id=?1", params![message_id, run])
-                .map_err(|e| e.to_string())?;
+            tx.execute(
+                "UPDATE messages SET status='running',run_id=?2 WHERE id=?1",
+                params![message_id, run],
+            )
+            .map_err(|e| e.to_string())?;
             tx.commit().map_err(|e| e.to_string())?;
         }
         self.messages(session)?
@@ -590,6 +704,16 @@ impl Store {
         message: &Message,
         status: &str,
         error: Option<&str>,
+    ) -> Result<(), String> {
+        self.finish_with_memory(session, message, status, error, None)
+    }
+    pub fn finish_with_memory(
+        &self,
+        session: &str,
+        message: &Message,
+        status: &str,
+        error: Option<&str>,
+        job: Option<&MemoryJob>,
     ) -> Result<(), String> {
         let mut db = self.db()?;
         let tx = db.transaction().map_err(|e| e.to_string())?;
@@ -613,7 +737,127 @@ impl Store {
             params![session, now()],
         )
         .map_err(|e| e.to_string())?;
+        if status == "completed" {
+            if let Some(job) = job {
+                let payload = serde_json::to_string(job).map_err(|e| e.to_string())?;
+                tx.execute("INSERT OR IGNORE INTO memory_jobs(id,payload,status,error) VALUES(?1,?2,?3,?4)", params![job.id,payload,job.status,job.error]).map_err(|e|e.to_string())?;
+            }
+        }
         tx.commit().map_err(|e| e.to_string())
+    }
+    pub fn memory_jobs(&self) -> Result<Vec<MemoryJob>, String> {
+        let db = self.db()?;
+        let mut stmt = db.prepare("SELECT payload,status,error,changed_count FROM memory_jobs ORDER BY rowid DESC LIMIT 200").map_err(|e|e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.map(|row| {
+            let (payload, status, error, changed_count) = row.map_err(|e| e.to_string())?;
+            let mut job: MemoryJob = serde_json::from_str(&payload).map_err(|e| e.to_string())?;
+            job.status = status;
+            job.error = error;
+            job.changed_count = changed_count as usize;
+            Ok(job)
+        })
+        .collect()
+    }
+    pub fn next_memory_job(&self) -> Result<Option<MemoryJob>, String> {
+        let db = self.db()?;
+        let raw: Option<String> = db
+            .query_row(
+                "SELECT payload FROM memory_jobs WHERE status='pending' ORDER BY rowid LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        raw.map(|raw| serde_json::from_str(&raw).map_err(|e| e.to_string()))
+            .transpose()
+    }
+    pub fn memory_job_status(
+        &self,
+        id: &str,
+        status: &str,
+        error: Option<&str>,
+        changed: usize,
+    ) -> Result<(), String> {
+        self.db()?
+            .execute(
+                "UPDATE memory_jobs SET status=?2,error=?3,changed_count=?4 WHERE id=?1",
+                params![id, status, error, changed as i64],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    pub fn save_memory_plan(&self, job: &MemoryJob) -> Result<(), String> {
+        let raw = serde_json::to_string(job).map_err(|e| e.to_string())?;
+        self.db()?
+            .execute(
+                "UPDATE memory_jobs SET payload=?2 WHERE id=?1",
+                params![job.id, raw],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    pub fn advance_memory_baselines(
+        &self,
+        finished: &MemoryJob,
+        record: &crate::memory::MemoryRecord,
+        before: Option<&str>,
+    ) -> Result<(), String> {
+        let mut db = self.db()?;
+        let tx = db.transaction().map_err(|e| e.to_string())?;
+        let payloads = {
+            let mut stmt = tx
+                .prepare("SELECT payload FROM memory_jobs WHERE status='pending' AND id!=?1")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([&finished.id], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        for raw in payloads {
+            let mut pending: MemoryJob = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+            if pending.vault != finished.vault
+                || pending.generation != finished.generation
+                || pending.created_at <= finished.created_at
+                || record.status != "active"
+            {
+                continue;
+            }
+            let baseline = pending
+                .baseline
+                .get(&record.id)
+                .map(|(revision, _)| revision.as_str());
+            if baseline == before {
+                pending.baseline.insert(
+                    record.id.clone(),
+                    (record.revision.clone(), record.status.clone()),
+                );
+                // Re-evaluate against the new preceding Lim commit, not an older generated plan.
+                pending.plan = None;
+                tx.execute(
+                    "UPDATE memory_jobs SET payload=?2 WHERE id=?1",
+                    params![
+                        pending.id,
+                        serde_json::to_string(&pending).map_err(|e| e.to_string())?
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+    pub fn invalidate_memory_jobs(&self) -> Result<(), String> {
+        self.db()?.execute("UPDATE memory_jobs SET status='obsolete',error='Cấu hình hoặc memory đã thay đổi; không áp dụng nguồn cũ' WHERE status IN ('pending','running','failed')",[]).map(|_|()).map_err(|e|e.to_string())
     }
 }
 
@@ -626,12 +870,22 @@ mod delete_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::open(&dir.join("t.sqlite3")).unwrap();
         let busy = store.create_session().unwrap().id;
-        store.begin(&busy, &Uuid::new_v4().to_string(), "m", "hi").unwrap();
-        assert!(store.delete_session(&busy).is_err(), "running session must not be deleted");
+        store
+            .begin(&busy, &Uuid::new_v4().to_string(), "m", "hi")
+            .unwrap();
+        assert!(
+            store.delete_session(&busy).is_err(),
+            "running session must not be deleted"
+        );
         assert_eq!(store.messages(&busy).unwrap().len(), 2);
         let idle = store.create_session().unwrap().id;
         store.delete_session(&idle).unwrap();
-        assert!(store.snapshot().unwrap().sessions.iter().all(|s| s.id != idle));
+        assert!(store
+            .snapshot()
+            .unwrap()
+            .sessions
+            .iter()
+            .all(|s| s.id != idle));
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -639,6 +893,19 @@ mod delete_tests {
 
 #[cfg(test)]
 mod session_config_tests {
+    #[test]
+    fn minimal_default_migrates_only_old_stock_prompt() {
+        let mut settings = super::InferenceSettings::default();
+        assert_eq!(settings.system_prompt, "You are a helpful assistant.");
+        settings.system_prompt = super::LEGACY_SYSTEM_PROMPT.into();
+        settings.normalize();
+        assert_eq!(settings.system_prompt, super::DEFAULT_SYSTEM_PROMPT);
+        for prompt in ["", "Reply in English."] {
+            settings.system_prompt = prompt.into();
+            settings.normalize();
+            assert_eq!(settings.system_prompt, prompt);
+        }
+    }
     use super::*;
     #[test]
     fn sessions_keep_independent_run_settings() {
@@ -646,27 +913,71 @@ mod session_config_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::open(&dir.join("t.sqlite3")).unwrap();
         let a = store.create_session().unwrap().id;
-        let mut custom = InferenceSettings { temperature: 1.3, num_predict: 6000, system_prompt: "Bạn là trợ lý viết văn.".into(), ..Default::default() };
-        store.set_session_config(&a, &SessionConfig { context_size: 16384, settings: custom.clone() }).unwrap();
+        let mut custom = InferenceSettings {
+            temperature: 1.3,
+            num_predict: 6000,
+            system_prompt: "Bạn là trợ lý viết văn.".into(),
+            ..Default::default()
+        };
+        store
+            .set_session_config(
+                &a,
+                &SessionConfig {
+                    context_size: 16384,
+                    settings: custom.clone(),
+                },
+            )
+            .unwrap();
         // A session created afterwards starts from defaults, not from the last applied session.
         let b = store.create_session().unwrap().id;
         let (ctx_a, set_a) = store.session_config(&a).unwrap();
         let (ctx_b, set_b) = store.session_config(&b).unwrap();
-        assert_eq!((ctx_a, set_a.temperature, set_a.num_predict, set_a.system_prompt.as_str()), (16384, 1.3, 6000, "Bạn là trợ lý viết văn."));
-        assert_eq!((ctx_b, set_b.temperature, set_b.num_predict), (4096, 0.7, 2048));
+        assert_eq!(
+            (
+                ctx_a,
+                set_a.temperature,
+                set_a.num_predict,
+                set_a.system_prompt.as_str()
+            ),
+            (16384, 1.3, 6000, "Bạn là trợ lý viết văn.")
+        );
+        assert_eq!(
+            (ctx_b, set_b.temperature, set_b.num_predict),
+            (4096, 0.7, 2048)
+        );
         assert_eq!(set_b.system_prompt, DEFAULT_SYSTEM_PROMPT);
         // An invalid window is rejected and the previous value stays.
         custom.num_predict = 8000;
-        assert!(store.set_session_config(&b, &SessionConfig { context_size: 4096, settings: custom }).is_err());
+        assert!(store
+            .set_session_config(
+                &b,
+                &SessionConfig {
+                    context_size: 4096,
+                    settings: custom
+                }
+            )
+            .is_err());
         assert_eq!(store.session_config(&b).unwrap().0, 4096);
         // Older partial configs fill missing fields from the global settings.
-        store.db().unwrap().execute("UPDATE sessions SET config='{\"contextSize\":8192}' WHERE id=?1", [&b]).unwrap();
+        store
+            .db()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET config='{\"contextSize\":8192}' WHERE id=?1",
+                [&b],
+            )
+            .unwrap();
         let (ctx, settings) = store.session_config(&b).unwrap();
         assert_eq!((ctx, settings.temperature), (8192, 0.7));
         // A config saved with separate thinking/answer budgets is folded into one output limit.
         store.db().unwrap().execute("UPDATE sessions SET config='{\"contextSize\":8192,\"numPredict\":1024,\"thinkPredict\":1024}' WHERE id=?1", [&b]).unwrap();
         assert_eq!(store.session_config(&b).unwrap().1.num_predict, 2048);
-        assert!(store.snapshot().unwrap().sessions.iter().all(|s| s.config.is_some()));
+        assert!(store
+            .snapshot()
+            .unwrap()
+            .sessions
+            .iter()
+            .all(|s| s.config.is_some()));
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }

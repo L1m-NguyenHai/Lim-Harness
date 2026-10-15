@@ -98,3 +98,7 @@
   .cookbook-statusbar { flex-wrap: wrap; }
 }
 .cookbook-search .icon-button { width: 24px; height: 24px; padding: 4px; flex-shrink: 0; color: var(--muted); }
+
+.cookbook-delete-confirm { padding: 12px; border-top: 1px solid var(--border); }
+.cookbook-delete-confirm p { margin: 0 0 8px; overflow-wrap: anywhere; }
+.cookbook-delete-confirm button + button { margin-left: 8px; }

@@ -2,7 +2,17 @@ import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
 import type { Message, Session } from "./state";
 
 export const native = isTauri();
-export type VaultHit = { path: string; title: string; excerpt: string };
+export type VaultHit = { path: string; title: string; excerpt: string; memoryId?: string; revision?: string };
+export type MemorySettings = { enabled: boolean; useMemory: boolean; autoMemory: boolean };
+export type MemorySource = { sessionId: string; messageId: string; quote: string };
+export type MemoryRecord = {
+  id: string; path: string; revision: string; title: string; category: string;
+  status: "active" | "retracted"; pinned: boolean; createdAt: string; updatedAt: string;
+  content: string; sources: MemorySource[]; history: MemoryHistory[];
+};
+export type MemoryHistory = { title: string; category: string; content: string; status: string; pinned: boolean; updatedAt: string; sources: MemorySource[] };
+export type MemoryJob = { id: string; sessionId: string; model: string; status: string; error: string | null; changedCount: number; createdAt: string };
+export type MemorySnapshot = { settings: MemorySettings; records: MemoryRecord[]; diagnostics: string[]; truncated: boolean; jobs: MemoryJob[] };
 export type VaultSearchResult = {
   hits: VaultHit[];
   scannedFiles: number;
@@ -12,7 +22,7 @@ export type VaultSearchResult = {
 export type InferenceSettings = { systemPrompt: string; temperature: number; topP: number; topK: number; repeatPenalty: number; numPredict: number; seed: number | null };
 export type RunUsage = { thinkingTokens: number; answerTokens: number; budget: number };
 export const defaultInference: InferenceSettings = {
-  systemPrompt: "Bạn là Lim, trợ lý AI chạy trên máy của người dùng. Mặc định trả lời bằng tiếng Việt, tự nhiên và ngắn gọn. Bạn chỉ trò chuyện bằng văn bản, không chạy lệnh và không đọc hay sửa tệp.",
+  systemPrompt: "You are a helpful assistant.",
   temperature: 0.7, topP: 0.9, topK: 40, repeatPenalty: 1.1, numPredict: 2048, seed: null,
 };
 export type Snapshot = { sessions: Session[]; model: string; vaultPath: string; contextSize: number; inferenceSettings: InferenceSettings };
@@ -42,7 +52,14 @@ export const core = {
   setContext: (contextSize: number) => invoke<void>("set_context_size", { contextSize }),
   setInference: (settings: InferenceSettings, contextSize: number) => invoke<void>("set_inference_settings", { settings, contextSize }),
   setVault: (path: string) => invoke<string>("set_vault", { path }),
+  initializeMemoryVault: () => invoke<string>("initialize_memory_vault"),
+  openMemoryObsidian: () => invoke<string>("open_memory_obsidian"),
   searchMemory: (query: string) => invoke<VaultSearchResult>("search_memory", { query }),
+  memorySnapshot: () => invoke<MemorySnapshot>("get_memory_snapshot"),
+  configureMemory: (settings: MemorySettings) => invoke<MemorySettings>("configure_memory", { settings }),
+  createMemory: (input: Pick<MemoryRecord, "title" | "category" | "content">) => invoke<MemoryRecord>("create_memory", { input }),
+  updateMemory: (input: Pick<MemoryRecord, "id" | "revision" | "title" | "category" | "content" | "pinned" | "status">) => invoke<MemoryRecord>("update_memory", { input }),
+  retryMemoryJob: (id: string) => invoke<void>("retry_memory_job", { id }),
   start: (sessionId: string, text: string, model: string, receive: (event: RunEvent) => void) => {
     const onEvent = new Channel<RunEvent>();
     onEvent.onmessage = receive;

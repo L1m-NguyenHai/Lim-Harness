@@ -10,7 +10,7 @@ import { ContextMeter } from "./ContextMeter";
 import { ThinkingSteps } from "./ThinkingSteps";
 import { thinkingSteps } from "./thinking-steps";
 import { contextUsage } from "./context-usage";
-import type { VaultHit } from "./core";
+import type { VaultHit, MemoryRecord, MemorySettings, MemorySnapshot } from "./core";
 import {
   ArrowUp,
   AudioLines,
@@ -56,7 +56,7 @@ const moduleIcons: Record<string, LucideIcon> = {
 type ToolPage = Exclude<Page, "chat">;
 const toolTitles: Record<ToolPage, string> = { cookbook: "Cookbook", memory: "Bộ nhớ", modules: "Module", settings: "Cài đặt" };
 const formatDate = (value: string) =>
-  new Intl.DateTimeFormat("vi-VN", {
+  !Number.isFinite(new Date(value).getTime()) ? "Ngày không hợp lệ" : new Intl.DateTimeFormat("vi-VN", {
     day: "2-digit",
     month: "2-digit",
     hour: "2-digit",
@@ -255,6 +255,27 @@ export default function App() {
       const canonical = await core.setVault(path);
       setVaultPath(canonical); setVaultDraft(canonical); setMemoryHits([]);
       setMemoryStatus(canonical ? "Đã kết nối vault. Ghi chú liên quan sẽ được tìm khi gửi tin nhắn." : "Đã ngắt vault.");
+    } catch (error) { setMemoryStatus(String(error)); }
+    finally { setMemoryBusy(false); }
+  }
+  async function initializeVault() {
+    if (memoryBusy || !native || !ready) return;
+    setMemoryBusy(true);
+    try {
+      const path = await core.initializeMemoryVault();
+      setVaultPath(path); setVaultDraft(path); setMemoryHits([]);
+      setMemoryStatus(`Đã khởi tạo và bật bộ nhớ: ${path}`);
+      setNotice("Đã khởi tạo vault và bật tự ghi nhớ.");
+      try { const message = await core.openMemoryObsidian(); setMemoryStatus(message); setNotice(message); }
+      catch (error) { const message = `Vault đã sẵn sàng. ${String(error)}`; setMemoryStatus(message); setNotice(message); }
+    } catch (error) { setMemoryStatus(String(error)); setNotice(String(error)); }
+    finally { setMemoryBusy(false); }
+  }
+  async function openObsidian() {
+    setMemoryBusy(true);
+    try {
+      const message = await core.openMemoryObsidian();
+      setMemoryStatus(message); setNotice(message);
     } catch (error) { setMemoryStatus(String(error)); }
     finally { setMemoryBusy(false); }
   }
@@ -693,7 +714,11 @@ export default function App() {
             className={`chat-main chat-column ${!session.messages.length ? "chat-empty" : ""}`}
           >
             <FloatingWindow {...windowProps("cookbook")} width={1100} height={780}>
-              <Cookbook visible={windows.cookbook === "open"} selectedModel={state.preferences.model} contextSize={effective.contextSize} chatBusy={Object.keys(running).length > 0} onContext={(size) => void chooseContext(size)} onChat={() => setPage("chat")} onSelected={(model, size) => {
+              <Cookbook visible={windows.cookbook === "open"} selectedModel={state.preferences.model} contextSize={effective.contextSize} chatBusy={Object.keys(running).length > 0} onContext={(size) => void chooseContext(size)} onChat={() => setPage("chat")} onDeleted={(model) => {
+                setState((c) => ({ ...c, preferences: { ...c.preferences, model: c.preferences.model.toLowerCase() === model.toLowerCase() ? "" : c.preferences.model } }));
+                void refreshModels();
+                setNotice(`Đã xoá ${model} khỏi máy.`);
+              }} onSelected={(model, size) => {
                 setContextSize(size);
                 setState((c) => ({ ...c, preferences: { ...c.preferences, provider: "ollama", model } }));
                 void refreshModels();
@@ -768,7 +793,7 @@ export default function App() {
                             {!isUser && m.metrics && (m.status === "completed" || m.status === "truncated") && formatMetrics(m.metrics, effective.numPredict) && (
                               <small className="message-metrics" title={metricsDetail(m.metrics)}>{formatMetrics(m.metrics, effective.numPredict)}</small>
                             )}
-                            {!!m.sources?.length && <details className="message-sources"><summary>Nguồn ghi chú ({m.sources.length})</summary>{m.sources.map((source, i) => <div key={source.path}><strong>[vault:{i + 1}] {source.title}</strong><small>{source.path}</small><p>{source.excerpt}</p></div>)}</details>}
+                            {!!m.sources?.length && <details className="message-sources"><summary>Nguồn tham khảo ({m.sources.length})</summary>{m.sources.map((source, i) => <div key={source.path}><strong>[vault:{i + 1}] {source.title}</strong><small>{source.path}{source.memoryId ? ` · memory ${source.memoryId} · bản ${source.revision?.slice(0, 12) ?? ""}` : ""}</small><p>{source.excerpt}</p></div>)}</details>}
                             <button
                               className="message-copy"
                               aria-label="Sao chép tin nhắn"
@@ -888,24 +913,12 @@ export default function App() {
             )}
             <FloatingWindow {...windowProps("memory")} offset={20}>
               <>
-                <PageHeading
-                  title="Bộ nhớ"
-                  description="Ghi chú cho công việc của bạn."
-                  action={
-                    <button
-                      className="primary-button"
-                      onClick={() => openNote()}
-                    >
-                      <Plus size={17} />
-                      Ghi chú mới
-                    </button>
-                  }
-                />
-                <div className="memory-status">
-                  <span className="status-dot" />
-                  {vaultPath ? "Obsidian đã kết nối · chỉ đọc" : "Ghi chú cục bộ · chưa chọn vault"}
-                </div>
+                <PageHeading title="Bộ nhớ" description="Những điều Lim nhớ, có nguồn và xem được trong Obsidian." />
+                <MemoryManager key={vaultPath} available={native && ready && !!vaultPath} vaultPath={vaultPath} notify={setNotice} connect={() => setPage("settings")} initialize={() => void initializeVault()} initializing={memoryBusy || !native || !ready} />
                 {vaultPath && <section className="settings-section vault-search"><form onSubmit={(e) => { e.preventDefault(); void searchVault(); }}><label htmlFor="vault-query">Tìm trong Obsidian</label><div className="vault-controls"><input id="vault-query" value={memoryQuery} onChange={(e) => setMemoryQuery(e.target.value)} maxLength={2000} placeholder="Từ khóa ghi chú" /><button className="secondary-button" disabled={memoryBusy || !memoryQuery.trim()}>Tìm</button></div></form><p role="status">{memoryStatus}</p>{memoryHits.map((hit, i) => <article className="vault-hit" key={hit.path}><h2>[vault:{i + 1}] {hit.title}</h2><small>{hit.path}</small><p>{hit.excerpt}</p></article>)}</section>}
+                <details className="local-notes-section"><summary>Ghi chú cục bộ ({state.notes.length})</summary>
+                <p>Lưu riêng trong ứng dụng; không tự đưa vào bộ nhớ Obsidian.</p>
+                <button className="secondary-button" onClick={() => openNote()}><Plus size={16} /> Ghi chú mới</button>
                 {state.notes.length ? (
                   <div className="note-grid">
                     {state.notes.map((n) => (
@@ -933,7 +946,7 @@ export default function App() {
                       Tạo ghi chú
                     </button>
                   </div>
-                )}
+                )}</details>
               </>
             </FloatingWindow>
             <FloatingWindow {...windowProps("modules")} width={720} height={560} offset={40}>
@@ -1010,9 +1023,11 @@ export default function App() {
                   </section>
                   <section className="settings-section">
                     <h2>Bộ nhớ Obsidian</h2>
+                    <div className="vault-controls"><button className="secondary-button" disabled={!native || !ready || memoryBusy || !!vaultPath} onClick={() => void initializeVault()}>{memoryBusy ? "Đang xử lý…" : "Khởi tạo vault mặc định"}</button>{vaultPath && <button className="secondary-button" disabled={!native || !ready || memoryBusy} onClick={() => void openObsidian()}>Mở trong Obsidian</button>}</div>
+                    <p>Tạo kho tại Documents/Lim Harness Memory, tự kết nối và bật bộ nhớ. Vault mới cần chọn Open folder as vault một lần trong Obsidian. Nếu đang kết nối vault khác, ngắt trước khi khởi tạo.</p>
                     <label htmlFor="vault-path">Thư mục vault</label>
                     <div className="vault-controls"><input id="vault-path" value={vaultDraft} onChange={(e) => setVaultDraft(e.target.value)} placeholder="C:\\Notes\\My Vault" maxLength={4096} /><button className="secondary-button" disabled={!native || !ready || memoryBusy || !vaultDraft.trim()} onClick={() => void connectVault(vaultDraft)}>Kết nối</button>{vaultPath && <button className="secondary-button" disabled={memoryBusy} onClick={() => void connectVault("")}>Ngắt</button>}</div>
-                    <p className="settings-status" role="status">{memoryStatus || "Chỉ đọc Markdown và tìm ghi chú liên quan khi gửi tin. Không sửa vault. Ghi chú cục bộ phía trên vẫn được lưu riêng."}</p>
+                    <p className="settings-status" role="status">{memoryStatus || "Kết nối để đọc ghi chú. Bật bộ nhớ trong cửa sổ Bộ nhớ để lưu Markdown vào LimMemory/."}</p>
                   </section>
                 </div>
               </>
@@ -1175,6 +1190,113 @@ export default function App() {
       </dialog>
     </>
   );
+}
+
+function MemoryManager({ available, vaultPath, notify, connect, initialize, initializing }: { available: boolean; vaultPath: string; notify: (text: string) => void; connect: () => void; initialize: () => void; initializing: boolean }) {
+  const [snapshot, setSnapshot] = useState<MemorySnapshot | null>(null);
+  const [error, setError] = useState("");
+  const [pending, setPending] = useState(false);
+  const [query, setQuery] = useState("");
+  const [showRetracted, setShowRetracted] = useState(false);
+  const [selected, setSelected] = useState<MemoryRecord | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [title, setTitle] = useState("");
+  const [category, setCategory] = useState("personal");
+  const [content, setContent] = useState("");
+  const seenJobs = useRef<Map<string, number> | null>(null);
+  const notification = useRef(notify);
+  notification.current = notify;
+  useEffect(() => {
+    if (!available) return;
+    let alive = true;
+    let inFlight = false;
+    async function poll() {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const next = await core.memorySnapshot();
+        if (!alive) return;
+        if (seenJobs.current) {
+          for (const job of next.jobs) {
+            if (job.changedCount > (seenJobs.current.get(job.id) ?? 0)) notification.current(`Đã cập nhật bộ nhớ · ${job.changedCount} thay đổi${job.status === "failed" ? "; một phần cần xem lại" : ""}`);
+          }
+        }
+        seenJobs.current = new Map(next.jobs.map((job) => [job.id, job.changedCount]));
+        setSnapshot(next);
+      } catch (cause) { if (alive) setError(String(cause)); }
+      finally { inFlight = false; }
+    }
+    void poll();
+    const timer = setInterval(() => void poll(), 3000);
+    return () => { alive = false; clearInterval(timer); };
+  }, [available]);
+  async function run(action: () => Promise<unknown>, success?: string) {
+    setPending(true); setError("");
+    try {
+      await action();
+      if (success) notify(success);
+      setSnapshot(await core.memorySnapshot());
+    } catch (cause) { setError(String(cause)); }
+    finally { setPending(false); }
+  }
+  function open(record: MemoryRecord | null) {
+    setSelected(record); setTitle(record?.title ?? ""); setCategory(record?.category ?? "personal"); setContent(record?.content ?? ""); setEditing(true); setError("");
+  }
+  async function save() {
+    await run(async () => {
+      const record = selected
+        ? await core.updateMemory({ id: selected.id, revision: selected.revision, title, category, content, pinned: selected.pinned, status: selected.status })
+        : await core.createMemory({ title, category, content });
+      setSelected(record); setEditing(false);
+    }, "Đã cập nhật bộ nhớ");
+  }
+  async function changeRecord(record: MemoryRecord, fields: Partial<Pick<MemoryRecord, "pinned" | "status">>) {
+    await run(async () => {
+      const changed = await core.updateMemory({ id: record.id, revision: record.revision, title: record.title, category: record.category, content: record.content, pinned: record.pinned, status: record.status, ...fields });
+      if (selected?.id === record.id) setSelected(changed);
+    }, fields.status === "retracted" ? "Đã quên memory; lịch sử được giữ lại." : "Đã cập nhật bộ nhớ");
+  }
+  if (!available) return <section className="settings-section"><p>{native ? "Khởi tạo vault tại Documents/Lim Harness Memory để bắt đầu, hoặc kết nối vault có sẵn trong Cài đặt." : "Mở ứng dụng desktop để dùng bộ nhớ Obsidian."}</p><div className="vault-controls"><button className="primary-button" disabled={initializing} onClick={initialize}>Khởi tạo vault mặc định</button><button className="secondary-button" onClick={connect}>Cài đặt vault</button></div></section>;
+  const settings = snapshot?.settings;
+  const normalize = (value: string) => value.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/đ/g, "d");
+  const records = snapshot?.records.filter((record) => (showRetracted || record.status === "active") && normalize(`${record.title} ${record.content}`).includes(normalize(query))) ?? [];
+  const current = selected && snapshot?.records.find((record) => record.id === selected.id);
+  const detail = editing ? selected : current;
+  const canWrite = !!settings?.enabled && !pending;
+  function configure(next: MemorySettings) { void run(() => core.configureMemory(next)); }
+  return <section className="markdown-memory" aria-label="Memory Obsidian">
+    <small className="memory-path">{vaultPath}/LimMemory/</small>
+    <button className="secondary-button" disabled={pending || !settings?.enabled} onClick={() => void run(async () => { notify(await core.openMemoryObsidian()); })}>Mở trong Obsidian</button>
+    <details className="memory-diagnostics"><summary>Sửa memory trong Obsidian</summary><p>Mở note trong LimMemory/facts/, sửa phần Nội dung hoặc thuộc tính title, pinned, status ở đầu note. Đặt status thành retracted để quên. Lim đọc lại ở lượt tiếp theo. Giữ nguyên ID, nguồn và metadata lịch sử do Lim quản lý.</p></details>
+    {!snapshot && !error && <p role="status">Đang đọc bộ nhớ…</p>}
+    {settings && <div className="memory-preferences">
+      <label><input type="checkbox" checked={settings.enabled} disabled={pending} onChange={(e) => configure({ enabled: e.target.checked, useMemory: e.target.checked ? true : settings.useMemory, autoMemory: e.target.checked ? true : settings.autoMemory })} /> Bật bộ nhớ cho vault</label>
+      <label><input type="checkbox" checked={settings.useMemory} disabled={!canWrite} onChange={(e) => configure({ ...settings, useMemory: e.target.checked })} /> Dùng memory khi trả lời</label>
+      <label><input type="checkbox" checked={settings.autoMemory} disabled={!canWrite} onChange={(e) => configure({ ...settings, autoMemory: e.target.checked })} /> Tự ghi nhớ sau hội thoại</label>
+      {!settings.enabled && <p>Vault đang chỉ đọc. Bật bộ nhớ để Lim tạo và cập nhật các note trong LimMemory/.</p>}
+    </div>}
+    {error && <div className="memory-error" role="alert"><p>{error}</p><button className="secondary-button" disabled={pending} onClick={() => void run(async () => { const next = await core.memorySnapshot(); if (selected) { const record = next.records.find((item) => item.id === selected.id); if (record) open(record); } })}>Tải lại từ vault</button></div>}
+    {!!snapshot?.diagnostics.length && <details className="memory-diagnostics"><summary>Tệp cần kiểm tra ({snapshot.diagnostics.length})</summary>{snapshot.diagnostics.map((text, i) => <p key={i}>{text}</p>)}</details>}
+    {snapshot?.truncated && <p role="status">Kho vượt giới hạn quét; danh sách có thể chưa đầy đủ.</p>}
+    <div className="memory-toolbar"><label htmlFor="memory-filter" className="sr-only">Tìm memory</label><input id="memory-filter" placeholder="Tìm điều Lim nhớ…" value={query} onChange={(e) => setQuery(e.target.value)} maxLength={2000} /><button className="primary-button" disabled={!canWrite} onClick={() => open(null)}><Plus size={16} /> Thêm memory</button></div>
+    <label className="memory-archive"><input type="checkbox" checked={showRetracted} onChange={(e) => setShowRetracted(e.target.checked)} /> Hiện memory đã quên</label>
+    <div className="memory-layout">
+      <div className="memory-records" aria-label="Danh sách memory">{records.map((record) => <button key={record.id} className={`memory-record ${selected?.id === record.id ? "selected" : ""}`} disabled={pending || editing} onClick={() => { setSelected(record); setEditing(false); }}><strong>{record.title}</strong><span>{record.status === "retracted" ? "Đã quên" : record.pinned ? "Đã ghim" : "Đang dùng"} · {record.category}</span><p>{record.content.slice(0, 160)}</p></button>)}{snapshot && !records.length && <p>Chưa có memory phù hợp.</p>}</div>
+      <div className="memory-detail">
+        {editing ? <form onSubmit={(e) => { e.preventDefault(); void save(); }}><h2>{selected ? "Sửa memory" : "Memory mới"}</h2>
+          <label htmlFor="memory-title">Tiêu đề</label><input id="memory-title" value={title} onChange={(e) => setTitle(e.target.value)} maxLength={160} required disabled={pending} />
+          <label htmlFor="memory-category">Loại</label><select id="memory-category" value={category} onChange={(e) => setCategory(e.target.value)} disabled={pending}><option value="personal">Cá nhân</option><option value="preference">Sở thích</option><option value="work">Công việc / quyết định</option>{!["personal", "preference", "work"].includes(category) && <option value={category}>{category}</option>}</select>
+          <label htmlFor="memory-content">Nội dung hiện tại</label><textarea id="memory-content" value={content} onChange={(e) => setContent(e.target.value)} maxLength={12000} rows={7} required disabled={pending} />
+          {selected && current?.revision !== selected.revision && <p role="status">Note đã thay đổi ngoài trình sửa. Bản nhập của bạn được giữ; tải lại trước khi lưu.</p>}
+          <div className="vault-controls"><button className="primary-button" disabled={!canWrite || !title.trim() || !content.trim() || (!!selected && current?.revision !== selected.revision)}>Lưu memory</button><button type="button" className="secondary-button" disabled={pending} onClick={() => setEditing(false)}>Hủy</button></div>
+        </form> : detail ? <article><h2>{detail.title}</h2><small>{detail.path}</small><p className="memory-content">{detail.content}</p><small>Cập nhật {formatDate(detail.updatedAt)} · {detail.status === "active" ? "Đang dùng" : "Đã quên"}</small><div className="vault-controls"><button className="secondary-button" disabled={!canWrite} onClick={() => open(detail)}>Sửa</button><button className="secondary-button" disabled={!canWrite || detail.status !== "active"} onClick={() => void changeRecord(detail, { pinned: !detail.pinned })}>{detail.pinned ? "Bỏ ghim" : "Ghim"}</button><button className="secondary-button" disabled={!canWrite || detail.status !== "active"} onClick={() => void changeRecord(detail, { status: "retracted" })}>Quên</button></div>
+          <h3>Nguồn</h3>{detail.sources.length ? detail.sources.map((source, i) => <blockquote key={i}><p>{source.quote}</p><small>Phiên {source.sessionId} · tin {source.messageId}</small></blockquote>) : <p>Người dùng thêm hoặc chỉnh sửa trực tiếp.</p>}
+          <details><summary>Lịch sử ({detail.history.length})</summary>{detail.history.map((entry, i) => <article className="memory-history" key={i}><strong>{entry.title}</strong><small>{formatDate(entry.updatedAt)} · {entry.status}</small><p>{entry.content}</p></article>)}</details>
+        </article> : <p>Chọn một memory để xem nội dung, nguồn và lịch sử.</p>}
+      </div>
+    </div>
+    {!!snapshot?.jobs.length && <details className="memory-jobs"><summary>Tự ghi nhớ ({snapshot.jobs.filter((job) => !["completed", "cancelled", "obsolete"].includes(job.status)).length} đang chờ / cần xem)</summary>{snapshot.jobs.map((job) => <div className="memory-job" key={job.id}><p>{({ pending: "Đang chờ", running: "Đang trích xuất", completed: "Hoàn tất", failed: "Lỗi", cancelled: "Đã dừng", obsolete: "Không còn áp dụng" } as Record<string, string>)[job.status] ?? job.status} · {job.model} · {job.changedCount} thay đổi</p><small>Phiên {job.sessionId} · {formatDate(job.createdAt)}</small>{job.error && <p>{job.error}</p>}{job.status === "failed" && <button className="secondary-button" disabled={!canWrite || !settings?.autoMemory} onClick={() => void run(() => core.retryMemoryJob(job.id))}>Thử lại</button>}</div>)}</details>}
+  </section>;
 }
 
 function PageHeading({

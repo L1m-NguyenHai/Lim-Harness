@@ -89,8 +89,15 @@ fn send(
         .map_err(|_| "Kênh Cookbook đã đóng".into())
 }
 async fn get_models(client: &reqwest::Client, path: &str) -> Result<Vec<Value>, String> {
+    get_models_at(client, OLLAMA, path).await
+}
+async fn get_models_at(
+    client: &reqwest::Client,
+    base: &str,
+    path: &str,
+) -> Result<Vec<Value>, String> {
     let response = client
-        .get(format!("{OLLAMA}{path}"))
+        .get(format!("{base}{path}"))
         .timeout(Duration::from_secs(8))
         .send()
         .await
@@ -150,16 +157,19 @@ pub async fn cookbook_snapshot(runtime: State<'_, Arc<Runtime>>) -> Result<Value
     let running=match ps{Ok(models)=>models.into_iter().map(|m|json!({"name":m["name"],"sizeBytes":m["size"],"sizeVramBytes":m["size_vram"],"contextLength":m["context_length"],"expiresAt":m["expires_at"]})).collect::<Vec<_>>(),Err(e)=>{if !errors.contains(&e){errors.push(e)}vec![]}};
     let hardware =
         hardware.unwrap_or_else(|_| unknown_hardware("Không đọc được thông tin phần cứng"));
-    let observations=runtime.store.setting("model_observations")?;
-    let observations=serde_json::from_str::<Value>(&observations).unwrap_or(Value::Null);
-    let measurements=observations.as_object().map(|observations|observations.values().cloned().collect::<Vec<_>>()).unwrap_or_default();
+    let observations = runtime.store.setting("model_observations")?;
+    let observations = serde_json::from_str::<Value>(&observations).unwrap_or(Value::Null);
+    let measurements = observations
+        .as_object()
+        .map(|observations| observations.values().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
     Ok(
         json!({"ollamaAvailable":available,"version":version,"measurements":measurements,"error":if errors.is_empty(){None}else{Some(errors.join("; "))},"hardware":hardware,"models":models,"running":running}),
     )
 }
 
 #[tauri::command]
-pub fn start_model_setup(
+pub async fn start_model_setup(
     runtime: State<'_, Arc<Runtime>>,
     cookbook: State<'_, Arc<Cookbook>>,
     model: String,
@@ -188,12 +198,7 @@ pub fn start_model_setup(
     if ![4096, 8192, 16384].contains(&context_size) {
         return Err("Context phải là 4096, 8192 hoặc 16384".into());
     }
-    let model_guard = Arc::clone(&runtime.model_gate)
-        .try_write_owned()
-        .map_err(|_| {
-            "Đang có hội thoại hoặc thao tác model. Chờ hoàn tất trước khi chuẩn bị model."
-                .to_string()
-        })?;
+    let model_guard = runtime.foreground_write().await?;
     let id = Uuid::new_v4().to_string();
     let (cancel, receiver) = watch::channel(false);
     {
@@ -438,9 +443,7 @@ pub async fn unload_model(
     model: String,
 ) -> Result<Value, String> {
     valid_model(&model)?;
-    let _model_guard = Arc::clone(&runtime.model_gate)
-        .try_write_owned()
-        .map_err(|_| "Đang có hội thoại hoặc thao tác model; chưa thể giải phóng model.")?;
+    let _model_guard = runtime.foreground_write().await?;
     if cookbook
         .active
         .lock()
@@ -486,6 +489,50 @@ pub async fn unload_model(
     Ok(
         json!({"unloaded":true,"model":model,"status":"Đã giải phóng model khỏi bộ nhớ; tệp đã cài vẫn được giữ"}),
     )
+}
+
+#[tauri::command]
+pub async fn delete_model(runtime: State<'_, Arc<Runtime>>, model: String) -> Result<(), String> {
+    valid_model(&model)?;
+    let _model_guard = runtime.foreground_write().await?;
+    delete_model_at(&runtime.client, OLLAMA, &model).await?;
+    if runtime.store.setting("model")?.eq_ignore_ascii_case(&model) {
+        runtime.store.set_setting("model", "")?;
+    }
+    Ok(())
+}
+
+async fn delete_model_at(client: &reqwest::Client, base: &str, model: &str) -> Result<(), String> {
+    let installed = get_models_at(client, base, "/api/tags").await?;
+    if !installed
+        .iter()
+        .any(|entry| entry["name"].as_str() == Some(model))
+    {
+        return Err("Model không còn trong danh sách đã tải. Hãy Scan lại.".into());
+    }
+    if get_models_at(client, base, "/api/ps")
+        .await?
+        .iter()
+        .any(|entry| same_model(entry, model))
+    {
+        return Err("Model đang được nạp. Chọn Unload trong tab Active trước khi xoá.".into());
+    }
+    let response = client
+        .delete(format!("{base}/api/delete"))
+        .timeout(Duration::from_secs(60))
+        .json(&json!({"model": model}))
+        .send()
+        .await
+        .map_err(|_| "Không xác nhận được việc xoá model. Hãy Scan lại.")?;
+    checked(response).await?;
+    if get_models_at(client, base, "/api/tags")
+        .await?
+        .iter()
+        .any(|entry| same_model(entry, model))
+    {
+        return Err("Ollama vẫn liệt kê model sau yêu cầu xoá. Hãy Scan lại.".into());
+    }
+    Ok(())
 }
 
 fn unknown_hardware(note: &str) -> Value {
@@ -605,11 +652,139 @@ mod model_name_tests {
     use super::valid_model;
     #[test]
     fn accepts_ollama_and_hugging_face_names() {
-        for ok in ["qwen3:4b", "library/qwen3", "user/model:tag", "hf.co/unsloth/Qwen3-4B-GGUF:Q4_K_M", "hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF"] {
+        for ok in [
+            "qwen3:4b",
+            "library/qwen3",
+            "user/model:tag",
+            "hf.co/unsloth/Qwen3-4B-GGUF:Q4_K_M",
+            "hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF",
+        ] {
             assert!(valid_model(ok).is_ok(), "{ok}");
         }
-        for bad in ["hf.co/onlyrepo", "hf.co/a/b/c", "example.com/user/model", "https://huggingface.co/a/b", "a:b:c", "../x"] {
+        for bad in [
+            "hf.co/onlyrepo",
+            "hf.co/a/b/c",
+            "example.com/user/model",
+            "https://huggingface.co/a/b",
+            "a:b:c",
+            "../x",
+        ] {
             assert!(valid_model(bad).is_err(), "{bad}");
         }
+    }
+}
+
+#[cfg(test)]
+mod deletion_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    async fn scenario(replies: Vec<(&str, &str, &str)>) -> Result<(), String> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let replies: Vec<_> = replies
+            .into_iter()
+            .map(|(path, status, body)| (path.to_owned(), status.to_owned(), body.to_owned()))
+            .collect();
+        let server = thread::spawn(move || {
+            for (path, status, body) in replies {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "missing request {path}");
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut bytes = [0; 1024];
+                    let n = socket.read(&mut bytes).unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&bytes[..n]);
+                    if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if request.len() < end + 4 + length {
+                            continue;
+                        }
+                        assert!(headers.starts_with(&path), "{headers}");
+                        if path.starts_with("DELETE") {
+                            let value: Value = serde_json::from_slice(&request[end + 4..]).unwrap();
+                            assert_eq!(value, json!({"model":"test:1b"}));
+                        }
+                        break;
+                    }
+                }
+                write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let result = delete_model_at(&reqwest::Client::new(), &base, "test:1b").await;
+        server.join().unwrap();
+        result
+    }
+
+    const TAGS: &str = r#"{"models":[{"name":"test:1b"}]}"#;
+    const EMPTY: &str = r#"{"models":[]}"#;
+
+    #[tokio::test]
+    async fn deletes_exact_tag_and_verifies_absence() {
+        assert!(scenario(vec![
+            ("GET /api/tags", "200 OK", TAGS),
+            ("GET /api/ps", "200 OK", EMPTY),
+            ("DELETE /api/delete", "200 OK", ""),
+            ("GET /api/tags", "200 OK", EMPTY)
+        ])
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn refuses_loaded_or_missing_model_without_deleting() {
+        assert!(scenario(vec![
+            ("GET /api/tags", "200 OK", TAGS),
+            ("GET /api/ps", "200 OK", TAGS)
+        ])
+        .await
+        .unwrap_err()
+        .contains("Unload"));
+        assert!(scenario(vec![("GET /api/tags", "200 OK", EMPTY)])
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn does_not_report_success_on_server_failure_or_remaining_tag() {
+        assert!(scenario(vec![
+            ("GET /api/tags", "200 OK", TAGS),
+            ("GET /api/ps", "200 OK", EMPTY),
+            ("DELETE /api/delete", "500 Internal Server Error", "{}")
+        ])
+        .await
+        .is_err());
+        assert!(scenario(vec![
+            ("GET /api/tags", "200 OK", TAGS),
+            ("GET /api/ps", "200 OK", EMPTY),
+            ("DELETE /api/delete", "200 OK", ""),
+            ("GET /api/tags", "200 OK", TAGS)
+        ])
+        .await
+        .is_err());
     }
 }

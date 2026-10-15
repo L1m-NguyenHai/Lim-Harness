@@ -10,7 +10,7 @@
 6. Tiến độ tính theo layer hiện tại, không phải phần trăm toàn bộ job. Có thể “Ngắt yêu cầu”; app ngắt stream cục bộ nhưng Ollama có thể còn xử lý phía server. Cache tải dở được giữ để thử lại. Làm mới để xem trạng thái thực tế.
 7. Nút giải phóng bên cạnh model đang nạp unload model, giữ tệp đã tải. Ollama cũng có thể tự unload sau 5 phút idle. Chat kế tiếp có thể nạp lại model đang chọn.
 
-Native chỉ cho một thao tác setup và chặn setup/unload khi chat đang chạy. Tải trực tiếp nhận tag Ollama hợp lệ ngoài catalog; model đã có trong Ollama có thể nạp và chọn. Không tự cài/chạy dịch vụ Ollama, tự tải khi mở trang, xóa model hoặc ghi vault.
+Native chỉ cho một thao tác setup và chặn setup/unload khi chat đang chạy. Tải trực tiếp nhận tag Ollama hợp lệ ngoài catalog; model đã có trong Ollama có thể nạp và chọn. Không tự cài/chạy dịch vụ Ollama, tự tải khi mở trang hoặc ghi vault.
 
 Nguồn tệp: `src/Cookbook.tsx`, `src/cookbook-api.ts`, `src/cookbook.css`, `src/model-catalog.ts`, `src-tauri/src/cookbook.rs`. Hardware dùng CIM Windows và NVIDIA `nvidia-smi` với giới hạn thời gian; thiếu dữ liệu được giữ là chưa xác định. Thư mục model lấy theo `OLLAMA_MODELS` của app hoặc mặc định người dùng; service dùng cấu hình khác có thể lưu nơi khác. Dung lượng trống hiển thị là thông tin tham khảo, lỗi ổ đĩa thực tế do Ollama xác nhận khi tải.
 
@@ -37,3 +37,7 @@ Fit dùng weights × 1,10 + 0,75 GiB runtime + KV giả định theo params/cont
 Bộ nhớ Obsidian cùng lịch sử, instruction và output đều chiếm context chung. Context 4K/8K là ngân sách tổng, không phải dung lượng ghi chú riêng. Không dùng context tối đa do model quảng bá để suy ra context vừa máy. Vision có thể cần thêm bộ nhớ ảnh/projector; ước lượng hiện phục vụ chat văn bản.
 
 Không xếp hạng chất lượng hay dự đoán token/giây. Chưa có benchmark hoặc bảo đảm tải/nạp model thành công. Mã fit được viết mới; Odysseus chỉ được tham khảo về cách tách hardware, catalog và lifecycle.
+
+## Xoá model đã tải
+
+Nút **Xoá** xuất hiện cạnh mỗi model đã tải ở Active/Launch/Download. Xác nhận đúng tag trước khi xoá; nếu model đang nạp, chọn **Unload** trong Active trước. Native chặn khi chat hoặc Cookbook đang dùng model, gọi [DELETE /api/delete của Ollama](https://docs.ollama.com/api/delete), rồi xác minh tag đã biến mất. Danh sách được làm mới và model bị xoá được bỏ chọn nếu đang chọn. Không xoá tệp model bằng filesystem. Các session từng chọn riêng tag này cần chọn model khác để tiếp tục.
