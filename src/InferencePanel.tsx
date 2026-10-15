@@ -2,10 +2,12 @@ import { useEffect, useRef, useState } from "react";
 import { RotateCcw, SlidersHorizontal, X } from "lucide-react";
 import { defaultInference, native } from "./core";
 import type { InferenceSettings } from "./core";
+
+const CONTEXT_SIZES = [4096, 8192, 16384, 32768, 65536, 131072];
 import "./inference.css";
 
-type Props = { sessionTitle: string; open: boolean; settings: InferenceSettings; contextSize: number; ready: boolean; model: string; onClose: () => void; onDirty: (dirty: boolean) => void; onSave: (settings: InferenceSettings, contextSize: number) => Promise<void> };
-export function InferencePanel({ sessionTitle, open, settings, contextSize, ready, model, onClose, onDirty, onSave }: Props) {
+type Props = { sessionTitle: string; modelMax: number | null; open: boolean; settings: InferenceSettings; contextSize: number; ready: boolean; model: string; onClose: () => void; onDirty: (dirty: boolean) => void; onSave: (settings: InferenceSettings, contextSize: number) => Promise<void> };
+export function InferencePanel({ sessionTitle, modelMax, open, settings, contextSize, ready, model, onClose, onDirty, onSave }: Props) {
   const [draft, setDraft] = useState(settings);
   const [draftContext, setDraftContext] = useState(contextSize);
   const previousContext = useRef(contextSize);
@@ -45,7 +47,8 @@ export function InferencePanel({ sessionTitle, open, settings, contextSize, read
     <form onSubmit={(event) => void save(event)}>
       <fieldset className="inference-fields" disabled={!ready || saving}>
         <section className="inference-section"><h3>Inference</h3>
-          <label className="inference-control" htmlFor="inference-context"><span>Context window</span><select id="inference-context" value={draftContext} onChange={(event) => setDraftContext(Number(event.target.value))}><option value={4096}>4 096 token</option><option value={8192}>8 192 token</option><option value={16384}>16 384 token</option></select><small>Tăng sẽ dùng thêm bộ nhớ</small></label>
+          <label className="inference-control" htmlFor="inference-context"><span>Context window</span><select id="inference-context" value={draftContext} onChange={(event) => setDraftContext(Number(event.target.value))}>{CONTEXT_SIZES.filter((size) => !modelMax || size <= modelMax || size === draftContext).map((size) => <option key={size} value={size}>{size / 1024}K token{modelMax && size > modelMax ? " · vượt mức model" : ""}</option>)}</select><small>{modelMax ? `Model hỗ trợ tối đa ${modelMax.toLocaleString("vi-VN")} token. ` : ""}Context lớn hơn dùng thêm RAM/VRAM và nạp lâu hơn.</small></label>
+          <label className="inference-control inference-check" htmlFor="inference-autocompact"><span><input id="inference-autocompact" type="checkbox" checked={draft.autoCompact} onChange={(event) => setDraft({ ...draft, autoCompact: event.target.checked })} />Tự động thu gọn hội thoại</span><small>Khi hội thoại vượt 75% chỗ trống, Lim tóm tắt các lượt cũ bằng model hiện tại và giữ nguyên các lượt gần nhất.</small></label>
           {controls.map(({ key, label, min, max, step, hint }) => <div className="inference-control" key={key}><div className="inference-control-top"><label htmlFor={`inference-${key}`}>{label}</label><input id={`inference-${key}`} type="number" min={min} max={max} step={key === "topK" || key === "numPredict" ? 1 : "any"} required value={Number.isFinite(draft[key]) ? draft[key] : ""} onChange={(event) => setDraft({ ...draft, [key]: event.target.valueAsNumber })} /></div>{key !== "numPredict" && <input type="range" aria-label={`${label} slider`} min={min} max={max} step={step} value={draft[key]} onChange={(event) => setDraft({ ...draft, [key]: Number(event.target.value) })} />}<small>{hint}</small></div>)}
           <label className="inference-control" htmlFor="inference-seed"><span>Seed</span><input id="inference-seed" type="number" min={0} max={2147483647} step={1} placeholder="Mặc định của model" value={draft.seed ?? ""} onChange={(event) => setDraft({ ...draft, seed: event.target.value === "" ? null : event.target.valueAsNumber })} /><small>Để trống để dùng mặc định của model</small></label>
         </section>

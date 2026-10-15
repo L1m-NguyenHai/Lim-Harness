@@ -1,5 +1,5 @@
 use crate::{
-    storage::{InferenceSettings, Message, Session, Snapshot, Store},
+    storage::{estimate_tokens, InferenceSettings, Message, Session, Snapshot, Store},
     vault,
 };
 use futures_util::StreamExt;
@@ -17,8 +17,45 @@ use tokio::sync::{watch, OwnedRwLockReadGuard, RwLock};
 use uuid::Uuid;
 
 const OLLAMA: &str = "http://127.0.0.1:11434";
+/// Tokens left for summary, notes and conversation after the system prompt, the output
+/// reservation and a framing margin.
 fn input_budget(context_size: usize, settings: &InferenceSettings) -> usize {
-    context_size.saturating_sub(settings.output_reserve() + settings.system_prompt.len() + 256)
+    context_size.saturating_sub(settings.output_reserve() + estimate_tokens(&settings.system_prompt) + 256)
+}
+/// Auto-compaction starts when summary + conversation pass this share of the input budget.
+const COMPACT_AT_PERCENT: usize = 75;
+/// After compaction the newest turns kept verbatim take about this share.
+const KEEP_RECENT_PERCENT: usize = 35;
+fn summary_block(summary: &str) -> String {
+    format!("Tóm tắt phần hội thoại trước (đã thu gọn để tiết kiệm context):\n{summary}")
+}
+/// Messages after the last one covered by the session summary.
+fn after_summary(messages: Vec<Message>, until: Option<&str>) -> Vec<Message> {
+    match until.and_then(|id| messages.iter().position(|m| m.id == id)) {
+        Some(index) => messages.into_iter().skip(index + 1).collect(),
+        None => messages,
+    }
+}
+/// System prompt with the session summary appended.
+fn system_with_summary(system: &str, summary: Option<&str>) -> String {
+    match summary.filter(|s| !s.trim().is_empty()) {
+        Some(summary) if system.is_empty() => summary_block(summary),
+        Some(summary) => format!("{system}\n\n{}", summary_block(summary)),
+        None => system.to_string(),
+    }
+}
+/// `/api/show` for a model, or None when Ollama does not answer.
+async fn model_show(runtime: &Runtime, model: &str) -> Option<Value> {
+    let response = runtime.client.post(format!("{OLLAMA}/api/show")).json(&json!({"model":model})).send().await.ok()?;
+    response.json::<Value>().await.ok()
+}
+/// The model's trained context length from GGUF metadata (e.g. qwen35.context_length).
+fn context_limit(info: &Value) -> Option<usize> {
+    info["model_info"].as_object()?.iter().find(|(key, _)| key.ends_with(".context_length")).and_then(|(_, v)| v.as_u64()).map(|v| v as usize)
+}
+#[tauri::command]
+pub async fn model_context(runtime: State<'_, Arc<Runtime>>, model: String) -> Result<Option<usize>, String> {
+    Ok(model_show(&runtime, model.trim()).await.as_ref().and_then(context_limit))
 }
 /// Streamed chunk counts. Ollama streams about one token per chunk, so these are live
 /// estimates; the final Ollama eval_count stays the authoritative total.
@@ -144,8 +181,8 @@ pub fn set_inference_settings(
 }
 #[tauri::command]
 pub fn set_context_size(state: State<'_, Arc<Runtime>>, context_size: usize) -> Result<(), String> {
-    if ![4096, 8192, 16384].contains(&context_size) {
-        return Err("Context phải là 4096, 8192 hoặc 16384".into());
+    if !crate::storage::CONTEXT_SIZES.contains(&context_size) {
+        return Err("Context phải là 4K, 8K, 16K, 32K, 64K hoặc 128K token".into());
     }
     state
         .store
@@ -217,11 +254,14 @@ pub async fn start_turn(
     let model = model.trim().to_string();
     let (context_size, settings) = state.store.session_config(&session_id)?;
     let memory_target = crate::memory_runtime::capture_target(&state)?;
+    // Message size in bytes: what the window can hold (~3 bytes/token), capped at 8.000.
+
     let maximum = input_budget(context_size, &settings)
-        .saturating_sub(32)
+        .saturating_sub(16)
+        .saturating_mul(3)
         .min(8_000);
     if maximum == 0 {
-        return Err(format!("Context {context_size} không còn chỗ cho tin nhắn sau khi dành {} token output và {} byte system prompt. Giảm output/system prompt hoặc tăng context.",settings.output_reserve(),settings.system_prompt.len()));
+        return Err(format!("Context {context_size} không còn chỗ cho tin nhắn sau khi dành {} token output và system prompt. Giảm output/system prompt hoặc tăng context.",settings.output_reserve()));
     }
     if text.is_empty() || text.len() > maximum {
         return Err(format!("Tin nhắn cần từ 1 đến {maximum} byte UTF-8 với context {context_size}. Rút gọn nội dung, giảm system prompt/output hoặc tăng context trong cài đặt."));
@@ -486,7 +526,7 @@ fn bounded_history(messages: Vec<Message>, budget: usize) -> Vec<Value> {
     let mut selected = Vec::new();
     let mut remaining = budget;
     for message in conversation(messages).into_iter().rev() {
-        let cost = message.text.len() + 32;
+        let cost = estimate_tokens(&message.text);
         if cost > remaining {
             break;
         }
@@ -514,13 +554,24 @@ async fn generate(
     thinking: &mut String,
     metrics: &mut Option<crate::storage::ChatMetrics>,
 ) -> Result<bool, String> {
-    let mut history = Vec::new();
-    if !settings.system_prompt.is_empty() {
-        history.push(json!({"role":"system","content":settings.system_prompt}));
+    let info = model_show(runtime, model).await;
+    let context_size = clamp_context(context_size, info.as_ref(), channel, run, session, sequence);
+    // Auto-compaction: summarize older turns before they push the conversation out.
+    if settings.auto_compact {
+        compact_with_events(runtime, session, model, context_size, settings, info.as_ref(), false, channel, run, session, sequence).await;
     }
-    let mut history_budget = input_budget(context_size, settings);
+    let (summary, until) = runtime.store.session_summary(session)?;
+    let system = system_with_summary(&settings.system_prompt, summary.as_deref());
+    let mut history = Vec::new();
+    if !system.is_empty() {
+        history.push(json!({"role":"system","content":system}));
+    }
+    let mut history_budget = input_budget(context_size, settings)
+        .saturating_sub(summary.as_deref().map_or(0, |s| estimate_tokens(&summary_block(s))));
     let mut retrieved_context = None;
-    let memory_budget = history_budget.saturating_sub(text.len() + 64).min(4_500);
+    // Notes get at most 4.500 bytes and never the room the new message needs.
+    let memory_budget = history_budget.saturating_sub(estimate_tokens(text) + 16).saturating_mul(3).min(4_500);
+
     let path = runtime.store.setting("vault")?;
     if !path.is_empty() {
         let config = crate::memory_runtime::settings(runtime, &path)?;
@@ -583,10 +634,11 @@ async fn generate(
             // Keep full source records with the question in one user turn. Some
             // chat templates do not preserve two consecutive user messages.
             let context = vault::memory_context(&hits);
-            history_budget = history_budget.saturating_sub(context.len() + 32);
+            history_budget = history_budget.saturating_sub(estimate_tokens(&context));
             retrieved_context = Some(context);
             assistant.sources = Some(hits.clone());
             runtime.store.save_sources(&assistant.id, &hits)?;
+
         }
         emit(
             channel,
@@ -596,7 +648,7 @@ async fn generate(
             json!({"type":"memory_sources","sources":assistant.sources.clone().unwrap_or_default(),"truncated":context_truncated,"skippedFiles":result.skipped_files,"scannedFiles":result.scanned_files,"diagnostics":memory_diagnostics}),
         )?;
     }
-    let transcript = bounded_history(runtime.store.messages(session)?, history_budget);
+    let transcript = bounded_history(after_summary(runtime.store.messages(session)?, until.as_deref()), history_budget);
     if !transcript
         .last()
         .is_some_and(|m| m["role"] == "user" && m["content"] == text)
@@ -666,26 +718,26 @@ async fn continue_generate(
     thinking: &mut String,
     metrics: &mut Option<crate::storage::ChatMetrics>,
 ) -> Result<bool, String> {
+    let info = model_show(runtime, model).await;
+    let context_size = clamp_context(context_size, info.as_ref(), channel, run, session, sequence);
+    let (summary, until) = runtime.store.session_summary(session)?;
     crate::memory_runtime::check_continuation_sources(runtime, assistant)?;
-    let all = runtime.store.messages(session)?;
-    let index = all
-        .iter()
-        .position(|m| m.id == assistant.id)
-        .ok_or("Không tìm thấy câu trả lời cần tiếp tục")?;
+    let all = after_summary(runtime.store.messages(session)?, until.as_deref());
+    let index = all.iter().position(|m| m.id == assistant.id).ok_or("Không tìm thấy câu trả lời cần tiếp tục")?;
+
     let prior: Vec<Message> = all.into_iter().take(index).collect();
-    // Budget in UTF-8 bytes at ~3 bytes per token (the reasoning already written counts at its
-    // real size, not at the stricter 1 byte = 1 token used for new turns).
-    let capacity = context_size * 3;
+    // Token budget: what is already written plus the conversation, the rest is new output.
+    let capacity = context_size;
     // Qwen-style models (ChatML with <think>) can resume the reasoning itself: the prompt is
     // built raw and ends inside the open <think> block (or after it, inside the answer).
-    let resume_thinking = chatml_thinking(runtime, model).await;
-    let mut system = settings.system_prompt.clone();
+    let resume_thinking = info.as_ref().is_some_and(chatml_thinking);
+    let mut system = system_with_summary(&settings.system_prompt, summary.as_deref());
     let carried_thinking = if resume_thinking {
-        thinking.len()
+        estimate_tokens(thinking)
     } else {
         // Other models: thinking off, the newest part of the draft passed as a note.
         let mut draft = thinking.trim();
-        let limit = capacity / 3;
+        let limit = capacity; // bytes: about a third of the window in tokens
         if draft.len() > limit {
             let mut cut = draft.len() - limit;
             while !draft.is_char_boundary(cut) {
@@ -719,24 +771,23 @@ async fn continue_generate(
     if !system.is_empty() {
         history.push(json!({"role":"system","content":system}));
     }
-    let mut carried = system.len() + carried_thinking + content.len() + 256 * 3;
+    let mut carried = estimate_tokens(&system) + carried_thinking + estimate_tokens(content) + 256;
     let mut retrieved_context = None;
     if let Some(hits) = assistant.sources.as_ref().filter(|hits| !hits.is_empty()) {
         let context = vault::memory_context(hits);
-        carried += context.len() + 32;
+        carried += estimate_tokens(&context);
         retrieved_context = Some(context);
+
     }
     // Keep room for a useful amount of output, then give the continuation whatever is left.
-    let wanted_output = settings.num_predict.min(512) * 3;
+    let wanted_output = settings.num_predict.min(512);
     let transcript = bounded_history(prior, capacity.saturating_sub(carried + wanted_output));
     if !transcript.last().is_some_and(|m| m["role"] == "user") {
         return Err("Không đủ context để tiếp tục câu trả lời này. Tăng Context window (ví dụ 8K) rồi bấm Tiếp tục.".into());
     }
-    let transcript_bytes: usize = transcript
-        .iter()
-        .map(|m| m["content"].as_str().map_or(0, str::len) + 32)
-        .sum();
-    let room = capacity.saturating_sub(carried + transcript_bytes) / 3;
+    let transcript_tokens: usize = transcript.iter().map(|m| estimate_tokens(m["content"].as_str().unwrap_or_default())).sum();
+    let room = capacity.saturating_sub(carried + transcript_tokens);
+
     let num_predict = settings.num_predict.min(room);
     if num_predict < 64 {
         return Err(format!("Phần đã viết gần chiếm hết context {context_size} token nên không còn chỗ để tiếp tục. Tăng Context window rồi bấm Tiếp tục."));
@@ -1039,25 +1090,127 @@ fn raw_frame(line: &[u8], split: &mut ThinkSplit) -> Result<Vec<u8>, String> {
 }
 /// True for models whose chat format is ChatML with a <think> block (Qwen3 family, including
 /// Qwen GGUFs from Hugging Face), which lets a continuation resume the reasoning itself.
-async fn chatml_thinking(runtime: &Runtime, model: &str) -> bool {
-    let Ok(response) = runtime
-        .client
-        .post(format!("{OLLAMA}/api/show"))
-        .json(&json!({"model":model}))
-        .send()
-        .await
-    else {
-        return false;
-    };
-    let Ok(info) = response.json::<Value>().await else {
-        return false;
-    };
+fn chatml_thinking(info: &Value) -> bool {
+
     let modelfile = info["modelfile"].as_str().unwrap_or_default();
     let template = info["template"].as_str().unwrap_or_default();
     modelfile
         .lines()
         .any(|line| line.trim().to_lowercase().starts_with("renderer qwen3"))
         || (template.contains("<|im_start|>") && template.contains("<think>"))
+}
+/// Uses at most the model's trained context; tells the UI when the session asks for more.
+fn clamp_context(context_size: usize, info: Option<&Value>, channel: &Channel<Value>, run: &str, session: &str, sequence: &mut u64) -> usize {
+    match info.and_then(context_limit) {
+        Some(limit) if limit < context_size => {
+            let _ = emit(channel, run, session, sequence, json!({"type":"notice","notice":format!("Model chỉ hỗ trợ context {limit} token; lượt này dùng {limit}.")}));
+            limit
+        }
+        _ => context_size,
+    }
+}
+#[allow(clippy::too_many_arguments)]
+async fn compact_with_events(runtime: &Runtime, session_id: &str, model: &str, context_size: usize, settings: &InferenceSettings, info: Option<&Value>, force: bool, channel: &Channel<Value>, run: &str, session: &str, sequence: &mut u64) {
+    if !needs_compaction(runtime, session_id, context_size, settings, force).unwrap_or(false) {
+        return;
+    }
+    let _ = emit(channel, run, session, sequence, json!({"type":"compacting"}));
+    let event = match compact(runtime, session_id, model, context_size, settings, info, force).await {
+        Ok(Some(count)) => json!({"type":"compacted","count":count}),
+        Ok(None) => json!({"type":"compacted","count":0}),
+        // Compaction is best effort: the turn continues with the rolling window.
+        Err(error) => json!({"type":"notice","notice":format!("Không thu gọn được hội thoại ({error}); dùng các tin gần nhất vừa context.")}),
+    };
+    let _ = emit(channel, run, session, sequence, event);
+}
+/// Conversation after the summary, in the form the model sees it.
+fn compactable(runtime: &Runtime, session: &str) -> Result<(Option<String>, Vec<Message>), String> {
+    let (summary, until) = runtime.store.session_summary(session)?;
+    Ok((summary, conversation(after_summary(runtime.store.messages(session)?, until.as_deref()))))
+}
+fn needs_compaction(runtime: &Runtime, session: &str, context_size: usize, settings: &InferenceSettings, force: bool) -> Result<bool, String> {
+    let (summary, messages) = compactable(runtime, session)?;
+    if messages.len() < 4 {
+        return Ok(false);
+    }
+    let used = summary.as_deref().map_or(0, |s| estimate_tokens(&summary_block(s))) + messages.iter().map(|m| estimate_tokens(&m.text)).sum::<usize>();
+    Ok(force || used * 100 > input_budget(context_size, settings) * COMPACT_AT_PERCENT)
+}
+/// Summarizes the oldest turns with the session's own model and stores the rolling summary.
+/// The newest turns (about KEEP_RECENT_PERCENT of the input budget, at least the last turn)
+/// stay verbatim. Returns how many messages were folded into the summary.
+async fn compact(runtime: &Runtime, session: &str, model: &str, context_size: usize, settings: &InferenceSettings, info: Option<&Value>, force: bool) -> Result<Option<usize>, String> {
+    let (summary, messages) = compactable(runtime, session)?;
+    let budget = input_budget(context_size, settings);
+    // Cut so the kept tail starts at a user message and holds at least one full turn.
+    let mut cut = messages.len();
+    let mut kept = 0;
+    while cut > 0 {
+        let cost = estimate_tokens(&messages[cut - 1].text);
+        if messages.len() - cut >= 2 && (kept + cost) * 100 > budget * KEEP_RECENT_PERCENT {
+            break;
+        }
+        kept += cost;
+        cut -= 1;
+    }
+    let last_turn = messages.iter().rposition(|m| m.role == "user").unwrap_or(0);
+    cut = cut.min(last_turn);
+    while cut > 0 && messages[cut].role != "user" {
+        cut -= 1;
+    }
+    // The summarizer must fit too: drop whole turns from the end of the chunk until it does.
+    let transcript = |end: usize| messages[..end].iter().map(|m| format!("{}: {}", if m.role == "user" { "Người dùng" } else { "Lim" }, m.text.trim())).collect::<Vec<_>>().join("\n\n");
+    let room = context_size.saturating_sub(512 + 400 + summary.as_deref().map_or(0, estimate_tokens));
+    while cut >= 2 && estimate_tokens(&transcript(cut)) > room {
+        cut -= 1;
+        while cut > 0 && messages[cut].role != "user" {
+            cut -= 1;
+        }
+    }
+    if cut < 2 {
+        return if force { Err("Chưa có đủ lượt cũ để thu gọn".into()) } else { Ok(None) };
+    }
+    let previous = summary.as_deref().filter(|s| !s.trim().is_empty()).map(|s| format!("Tóm tắt trước đó:\n{s}\n\n")).unwrap_or_default();
+    let mut request = json!({
+        "model": model,
+        "stream": false,
+        "messages": [
+            {"role":"system","content":"Bạn tóm tắt hội thoại cho trợ lý Lim để dùng làm ngữ cảnh. Viết bằng tiếng Việt, tối đa khoảng 200 từ, dạng gạch đầu dòng ngắn. Giữ: mục tiêu và yêu cầu của người dùng, thông tin và quyết định quan trọng, tên riêng, số liệu, việc còn dang dở. Gộp với tóm tắt trước đó nếu có. Không thêm thông tin mới, không chào hỏi."},
+            {"role":"user","content":format!("{previous}Phần hội thoại cần gộp vào tóm tắt:\n{}", transcript(cut))}
+        ],
+        "options": {"num_ctx": context_size, "num_predict": 512, "temperature": 0.3}
+    });
+    // Thinking adds nothing to a summary; only models that support it accept the flag.
+    if info.is_some_and(|info| info["capabilities"].as_array().is_some_and(|c| c.iter().any(|v| v == "thinking"))) {
+        request["think"] = json!(false);
+    }
+    let response = runtime.client.post(format!("{OLLAMA}/api/chat")).json(&request).timeout(Duration::from_secs(180)).send().await.map_err(|_| "không kết nối được Ollama")?;
+    if !response.status().is_success() {
+        return Err(format!("Ollama trả HTTP {}", response.status()));
+    }
+    let body: Value = response.json().await.map_err(|_| "phản hồi không hợp lệ")?;
+    let text = body["message"]["content"].as_str().unwrap_or_default().trim().to_string();
+    if text.is_empty() {
+        return Err("model không trả bản tóm tắt".into());
+    }
+    runtime.store.set_session_summary(session, &text, &messages[cut - 1].id)?;
+    Ok(Some(cut))
+}
+/// Manual "Thu gọn ngay": summarize older turns of an idle session now.
+#[tauri::command]
+pub async fn compact_session(state: State<'_, Arc<Runtime>>, session_id: String, model: String) -> Result<usize, String> {
+    let _guard = Arc::clone(&state.model_gate).try_read_owned().map_err(|_| "Cookbook đang chuẩn bị model; thử lại sau.")?;
+    if state.active.lock().map_err(|_| "Runtime không khả dụng")?.contains_key(&session_id) {
+        return Err("Phiên đang chạy; đợi xong rồi thu gọn.".into());
+    }
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        return Err("Chọn model Ollama để thu gọn.".into());
+    }
+    let (context_size, settings) = state.store.session_config(&session_id)?;
+    let info = model_show(&state, &model).await;
+    let context_size = info.as_ref().and_then(context_limit).map_or(context_size, |limit| context_size.min(limit));
+    compact(&state, &session_id, &model, context_size, &settings, info.as_ref(), true).await.map(|count| count.unwrap_or(0))
 }
 fn completed(content: &str) -> Result<(), String> {
     if content.trim().is_empty() {
@@ -1480,5 +1633,64 @@ mod history_tests {
             msg("user", "tiếp đi", "completed"),
         ];
         assert_eq!(bounded_history(partial, 10_000).len(), 3);
+    }
+}
+#[cfg(test)]
+mod compaction_tests {
+    use super::*;
+    fn store_with_turns(turns: &[(&str, &str)]) -> (Runtime, String, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("lim-compact-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runtime = Runtime::new(crate::storage::Store::open(&dir.join("t.sqlite3")).unwrap()).unwrap();
+        let session = runtime.store.create_session().unwrap().id;
+        for (question, answer) in turns {
+            let run = Uuid::new_v4().to_string();
+            let (_, mut assistant) = runtime.store.begin(&session, &run, "qwen3.5:2b", question).unwrap();
+            assistant.text = answer.to_string();
+            runtime.store.finish(&session, &assistant, "completed", None).unwrap();
+        }
+        (runtime, session, dir)
+    }
+    #[test]
+    fn compaction_threshold() {
+        let settings = InferenceSettings::default();
+        let (short, session, dir) = store_with_turns(&[("hi", "Chào bạn"), ("khỏe không", "Khỏe")]);
+        assert!(!needs_compaction(&short, &session, 4096, &settings, false).unwrap());
+        drop(short);
+        let _ = std::fs::remove_dir_all(dir);
+        // 4K window, 2.048 output: input budget ~1.700 tokens; 6 turns of ~600 bytes pass 75%.
+        let long = "Nội dung khá dài về kế hoạch dự án Lim Harness. ".repeat(12);
+        let turns: Vec<(&str, &str)> = (0..6).map(|_| (long.as_str(), long.as_str())).collect();
+        let (runtime, session, dir) = store_with_turns(&turns);
+        assert!(needs_compaction(&runtime, &session, 4096, &settings, false).unwrap());
+        assert!(!needs_compaction(&runtime, &session, 131072, &settings, false).unwrap());
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    /// Live: `cargo test --lib compacts_with_local_model -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn compacts_with_local_model() {
+        let facts = [
+            ("Tên dự án của tôi là Lim Harness, viết bằng Tauri.", "Đã ghi nhận: Lim Harness dùng Tauri."),
+            ("Hạn nộp đồ án là ngày 20 tháng 12.", "Đã ghi nhận hạn nộp 20/12."),
+            ("Tôi muốn bộ nhớ dùng Obsidian vault.", "Được, bộ nhớ sẽ đọc từ Obsidian vault."),
+            ("Model chính là qwen3.5:2b qua Ollama.", "Đã ghi nhận model qwen3.5:2b."),
+            ("Giao diện tối giản, màu xanh lá.", "Đã ghi nhận giao diện tối giản xanh lá."),
+            ("Giờ hãy nhắc lại hạn nộp giúp tôi.", "Hạn nộp là 20/12."),
+        ];
+        let padded: Vec<(String, String)> = facts.iter().map(|(q, a)| (format!("{q} {}", "Ghi chú thêm. ".repeat(25)), a.to_string())).collect();
+        let turns: Vec<(&str, &str)> = padded.iter().map(|(q, a)| (q.as_str(), a.as_str())).collect();
+        let (runtime, session, dir) = store_with_turns(&turns);
+        let settings = InferenceSettings::default();
+        let info = tauri::async_runtime::block_on(model_show(&runtime, "qwen3.5:2b"));
+        let folded = tauri::async_runtime::block_on(compact(&runtime, &session, "qwen3.5:2b", 4096, &settings, info.as_ref(), false)).unwrap();
+        let (summary, until) = runtime.store.session_summary(&session).unwrap();
+        let kept = after_summary(runtime.store.messages(&session).unwrap(), until.as_deref());
+        println!("folded {folded:?} messages, kept {} verbatim\nsummary:\n{}", kept.len(), summary.clone().unwrap_or_default());
+        assert!(folded.unwrap_or(0) >= 2 && summary.is_some());
+        assert!(kept.len() >= 2 && kept[0].role == "user", "newest turns stay verbatim, starting at a question");
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

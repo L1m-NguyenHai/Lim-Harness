@@ -195,8 +195,8 @@ pub async fn start_model_setup(
     };
     valid_model(&model)?;
     let download_only = download_only.unwrap_or(false);
-    if ![4096, 8192, 16384].contains(&context_size) {
-        return Err("Context phải là 4096, 8192 hoặc 16384".into());
+    if !crate::storage::CONTEXT_SIZES.contains(&context_size) {
+        return Err("Context phải là 4K, 8K, 16K, 32K, 64K hoặc 128K token".into());
     }
     let model_guard = runtime.foreground_write().await?;
     let id = Uuid::new_v4().to_string();

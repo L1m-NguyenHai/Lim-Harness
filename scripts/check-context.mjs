@@ -1,33 +1,36 @@
 import assert from 'node:assert/strict';
-import { contextUsage, utf8Bytes } from '../src/context-usage.ts';
+import { contextUsage, estimateTokens } from '../src/context-usage.ts';
 
-const msg = (role, text, extra = {}) => ({ id: Math.random().toString(36), role, text, status: 'completed', ...extra });
+const msg = (role, text, extra = {}) => ({ id: Math.random().toString(36).slice(2), role, text, status: 'completed', ...extra });
 const system = 'Bạn là Lim.';
-// Budget mirrors runtime.rs input_budget: context − (num_predict + system bytes + 256).
-const empty = contextUsage([], '', 4096, 2048, system);
-assert.equal(empty.historyBudgetBytes, 4096 - (2048 + utf8Bytes(system) + 256));
-assert.equal(empty.measured, false);
+// Input budget mirrors runtime.rs input_budget: context − output − system tokens − 256.
+const empty = contextUsage({ messages: [] }, '', 4096, 2048, system);
+assert.equal(empty.inputBudget, 4096 - 2048 - 256 - estimateTokens(system));
+assert.equal(empty.nextPromptTokens, estimateTokens(system));
 
-// Real Ollama counts from the latest completed turn drive the estimate.
-const history = [msg('user', 'hi'), msg('assistant', 'Chào bạn', { metrics: { promptTokens: 120, outputTokens: 30 } })];
-const measured = contextUsage(history, 'abc', 4096, 2048, system);
-assert.equal(measured.measured, true);
-assert.equal(measured.nextPromptTokens, 150 + 1);
-assert.equal(measured.includedMessages, 2);
-assert.equal(measured.droppedMessages, 0);
-
-// Oldest messages are dropped first once the byte budget is spent; previews, failed replies and
-// the questions they leave unanswered never count (mirrors runtime.rs conversation()).
-const long = 'x'.repeat(700);
-const crowded = [msg('user', long), msg('assistant', long), msg('user', 'preview', { source: 'ui_preview' }), msg('user', 'hỏi lỗi'), msg('assistant', 'lỗi', { status: 'failed' }), msg('user', long), msg('assistant', long)];
-const cut = contextUsage(crowded, '', 4096, 2048, system);
-assert.equal(cut.includedMessages, 2);
-assert.equal(cut.droppedMessages, 2);
-// A question whose answer stopped while thinking (empty) is left out, so the next draft does not
-// follow another user turn.
-const orphan = contextUsage([msg('user', 'viết về con bò'), msg('assistant', '', { status: 'truncated' })], 'chào', 4096, 2048, system);
+// Answered turns count; a question left unanswered (stopped while thinking) does not.
+const orphan = contextUsage({ messages: [msg('user', 'viết về con bò'), msg('assistant', '', { status: 'truncated' })] }, 'chào', 4096, 2048, system);
 assert.equal(orphan.includedMessages + orphan.droppedMessages, 0);
+assert.equal(orphan.draftTokens, estimateTokens('chào'));
 
-// A draft larger than the whole history budget is flagged.
-assert.equal(contextUsage([], 'y'.repeat(5000), 4096, 2048, system).draftFits, false);
+// Messages covered by the summary are replaced by the summary block.
+const first = msg('user', 'cũ'); const firstAnswer = msg('assistant', 'trả lời cũ');
+const withSummary = contextUsage({ messages: [first, firstAnswer, msg('user', 'mới'), msg('assistant', 'trả lời mới')], summary: 'Người dùng hỏi điều cũ.', summaryUntil: firstAnswer.id }, '', 4096, 2048, system);
+assert.equal(withSummary.summarizedMessages, 2);
+assert.equal(withSummary.includedMessages, 2);
+assert.ok(withSummary.summaryTokens > 0);
+
+// Long conversation: over the 75% threshold, newest turns fit first, oldest are dropped.
+const long = 'x'.repeat(1500); // ~504 tokens each
+const turns = Array.from({ length: 4 }, () => [msg('user', long), msg('assistant', long)]).flat();
+const full = contextUsage({ messages: turns }, '', 4096, 2048, system);
+assert.equal(full.overThreshold, true);
+assert.equal(full.canCompact, true);
+assert.equal(full.includedMessages, 3);
+assert.equal(full.droppedMessages, 5);
+// A bigger window holds everything and stays under the threshold.
+assert.equal(contextUsage({ messages: turns }, '', 32768, 2048, system).overThreshold, false);
+
+// A draft larger than the whole input budget is flagged.
+assert.equal(contextUsage({ messages: [] }, 'y'.repeat(9000), 4096, 2048, system).draftFits, false);
 console.log('Context usage checks passed');
