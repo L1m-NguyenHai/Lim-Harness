@@ -13,12 +13,19 @@ pub fn now() -> String {
 fn preview_source() -> String {
     "ui_preview".into()
 }
+/// Context windows a session can pick; a model's own maximum is applied when it runs.
+pub const CONTEXT_SIZES: [usize; 6] = [4096, 8192, 16384, 32768, 65536, 131072];
+/// Token estimate without a tokenizer (Ollama exposes none): ~3 UTF-8 bytes per token plus
+/// a few tokens of chat framing per message. Vietnamese runs close to 3 bytes/token.
+pub fn estimate_tokens(text: &str) -> usize {
+    text.len().div_ceil(3) + 4
+}
 fn check_window(context_size: usize, settings: &InferenceSettings) -> Result<(), String> {
-    if ![4096, 8192, 16384].contains(&context_size) {
-        return Err("Context phải là 4096, 8192 hoặc 16384.".into());
+    if !CONTEXT_SIZES.contains(&context_size) {
+        return Err("Context phải là 4K, 8K, 16K, 32K, 64K hoặc 128K token.".into());
     }
-    if context_size.saturating_sub(settings.output_reserve() + settings.system_prompt.len() + 256) < 64 {
-        return Err("Cấu hình phải còn ít nhất 64 byte UTF-8 cho context đầu vào sau khi dành suy nghĩ, trả lời, system prompt và framing. Giảm giới hạn/system prompt hoặc tăng context.".into());
+    if context_size.saturating_sub(settings.output_reserve() + estimate_tokens(&settings.system_prompt) + 256) < 64 {
+        return Err("Context phải còn ít nhất 64 token cho hội thoại sau khi dành output, system prompt và framing. Giảm giới hạn output/system prompt hoặc tăng context.".into());
     }
     Ok(())
 }
@@ -38,6 +45,8 @@ pub struct InferenceSettings {
     #[serde(default, rename = "thinkPredict", skip_serializing)]
     pub(crate) legacy_think_predict: usize,
     pub seed: Option<i64>,
+    /// Summarize older turns when the conversation nears the context limit.
+    pub auto_compact: bool,
 }
 impl Default for InferenceSettings {
     fn default() -> Self {
@@ -50,6 +59,7 @@ impl Default for InferenceSettings {
             num_predict: 2048,
             legacy_think_predict: 0,
             seed: None,
+            auto_compact: true,
         }
     }
 }
@@ -152,6 +162,11 @@ pub struct Session {
     /// None: the session follows the global defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<SessionConfig>,
+    /// Summary of older turns (auto/manual compaction) and the last message it covers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, rename = "summaryUntil", skip_serializing_if = "Option::is_none")]
+    pub summary_until: Option<String>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -181,6 +196,8 @@ impl Store {
             "ALTER TABLE messages ADD COLUMN thinking TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE messages ADD COLUMN metrics TEXT",
             "ALTER TABLE sessions ADD COLUMN config TEXT",
+            "ALTER TABLE sessions ADD COLUMN summary TEXT",
+            "ALTER TABLE sessions ADD COLUMN summary_until TEXT",
         ] {
             let _ = connection.execute(migration, []);
         }
@@ -227,7 +244,7 @@ impl Store {
         let sessions = {
             let db = self.db()?;
             let mut stmt = db
-                .prepare("SELECT id,title,created,config FROM sessions ORDER BY updated DESC,rowid DESC")
+                .prepare("SELECT id,title,created,config,summary,summary_until FROM sessions ORDER BY updated DESC,rowid DESC")
                 .map_err(|e| e.to_string())?;
             let rows = stmt
                 .query_map([], |r| {
@@ -238,6 +255,8 @@ impl Store {
                         created: r.get(2)?,
                         messages: vec![],
                         config: config.and_then(|raw| serde_json::from_str(&raw).ok()),
+                        summary: r.get(4).unwrap_or(None),
+                        summary_until: r.get(5).unwrap_or(None),
                     })
                 })
                 .map_err(|e| e.to_string())?;
@@ -280,7 +299,7 @@ impl Store {
             match key.as_str() {
                 "context_size" => {
                     let value = value.parse().unwrap_or(4096);
-                    context_size = if [4096, 8192, 16384].contains(&value) {
+                    context_size = if CONTEXT_SIZES.contains(&value) {
                         value
                     } else {
                         4096
@@ -352,6 +371,8 @@ impl Store {
             created: now(),
             messages: vec![],
             config: Some(config.clone()),
+            summary: None,
+            summary_until: None,
         };
         let encoded = serde_json::to_string(&config).map_err(|e| e.to_string())?;
         self.db()?
@@ -399,6 +420,17 @@ impl Store {
             return Err("Không tìm thấy phiên".into());
         }
         Ok(())
+    }
+    pub fn session_summary(&self, session: &str) -> Result<(Option<String>, Option<String>), String> {
+        self.db()?
+            .query_row("SELECT summary,summary_until FROM sessions WHERE id=?1", [session], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|_| "Không tìm thấy phiên".to_string())
+    }
+    pub fn set_session_summary(&self, session: &str, summary: &str, until: &str) -> Result<(), String> {
+        self.db()?
+            .execute("UPDATE sessions SET summary=?2,summary_until=?3 WHERE id=?1", params![session, summary, until])
+            .map_err(|e| e.to_string())
+            .map(|_| ())
     }
     /// Deletes a session with its messages and runs. Refuses while a run is still active.
     pub fn delete_session(&self, session: &str) -> Result<(), String> {

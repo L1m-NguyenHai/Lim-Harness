@@ -33,6 +33,9 @@ export type Session = {
   created: string;
   messages: Message[];
   config?: SessionConfig;
+  /** Summary of older turns (compaction) and the id of the last message it covers. */
+  summary?: string;
+  summaryUntil?: string;
 };
 export type Note = {
   id: string;

@@ -33,6 +33,8 @@ pub fn run() {
             runtime::list_models,
             runtime::start_turn,
             runtime::continue_turn,
+            runtime::compact_session,
+            runtime::model_context,
             runtime::cancel_turn,
             cookbook::cookbook_snapshot,
             cookbook::start_model_setup,

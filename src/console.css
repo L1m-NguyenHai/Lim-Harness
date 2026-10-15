@@ -244,3 +244,16 @@ kbd, code, pre { font-family: var(--font-mono); }
 .message-truncated { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; margin-top: 8px; }
 .message-truncated .message-status { color: var(--ochre); }
 .message-truncated .secondary-button { display: inline-flex; align-items: center; gap: 6px; min-height: 28px; padding: 4px 11px; border-radius: 999px; }
+
+/* Context management: meter parts, compact action, summary divider */
+.seg-system { background: var(--violet); }
+.seg-summary { background: var(--ochre); }
+.context-actions { display: grid; gap: 6px; margin-top: 4px; }
+.context-actions .secondary-button { justify-self: start; min-height: 28px; padding: 4px 11px; border-radius: 999px; font-size: 12px; }
+.context-actions small { color: var(--muted); font-size: 12px; line-height: 1.5; }
+.inference-check > span { display: flex; align-items: center; gap: 8px; }
+.inference-panel .inference-check input[type=checkbox] { width: auto; accent-color: var(--accent); }
+.compact-divider { max-width: 760px; margin: 0 auto 24px; border: 1px dashed var(--composer-border); border-radius: 10px; background: var(--sidebar); }
+.compact-divider > summary { cursor: pointer; padding: 7px 12px; font-family: var(--font-mono); font-size: 12px; color: var(--muted); list-style: none; text-align: center; }
+.compact-divider > summary::-webkit-details-marker { display: none; }
+.compact-divider > p { margin: 0; padding: 0 14px 12px; font-size: 13px; line-height: 1.6; color: var(--text); white-space: pre-wrap; }

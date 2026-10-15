@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import Logo from "./Logo";
 import Cookbook from "./Cookbook";
 import FloatingWindow from "./FloatingWindow";
@@ -74,7 +74,8 @@ function splitThink(text: string): { thinking: string; answer: string } {
   };
 }
 // Live per-phase token estimate while a run streams (Ollama sends ~1 token per chunk).
-function liveUsage(meta: { startedAt: number; chars: number; usage?: RunUsage }): string {
+function liveUsage(meta: { startedAt: number; chars: number; usage?: RunUsage; compacting?: boolean }): string {
+  if (meta.compacting) return "Đang thu gọn hội thoại cũ…";
   const u = meta.usage;
   const seconds = (Date.now() - meta.startedAt) / 1000;
   const parts: string[] = [];
@@ -85,21 +86,35 @@ function liveUsage(meta: { startedAt: number; chars: number; usage?: RunUsage })
   return parts.length ? `${parts.join(" · ")} · ${phase}…` : "Đang chạy…";
 }
 // One output limit: show Ollama's real total against it; the thinking/answer split is an estimate.
+// Splits Ollama's real output total: the answer part is the streamed answer estimate, the rest
+// is reasoning (Vietnamese text streams fewer chunks than tokens, so the split stays consistent).
+function outputSplit(m: import("./state").ChatMetrics) {
+  if (m.outputTokens == null || !m.thinkingTokens) return null;
+  const answer = Math.min(m.outputTokens, m.answerTokens ?? 0);
+  return { thinking: m.outputTokens - answer, answer };
+}
 function formatMetrics(m: import("./state").ChatMetrics | undefined, limit: number): string {
   if (!m) return "";
   const parts: string[] = [];
+  const vi = (value: number) => value.toLocaleString("vi-VN");
   // The limit is cumulative: each "Tiếp tục" adds one run's limit to the answer.
   const granted = m.outputLimit ?? limit;
-  if (m.outputTokens != null) parts.push(`${m.outputTokens.toLocaleString("vi-VN")}/${granted.toLocaleString("vi-VN")} token`);
+  const split = outputSplit(m);
+  if (m.outputTokens != null) parts.push(`Output ${vi(m.outputTokens)}/${vi(granted)} token${split ? ` (suy nghĩ ~${vi(split.thinking)} · trả lời ~${vi(split.answer)})` : ""}`);
   if (m.tokensPerSecond != null && Number.isFinite(m.tokensPerSecond))
     parts.push(`${m.tokensPerSecond.toFixed(1)} token/s`);
   const ms = m.totalDurationMs ?? m.evalDurationMs;
   if (ms != null) parts.push(ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`);
   return parts.join(" · ");
 }
-function metricsDetail(m?: import("./state").ChatMetrics): string {
-  if (!m?.thinkingTokens && !m?.answerTokens) return "";
-  return `Ước tính: suy nghĩ ~${m.thinkingTokens ?? 0}, trả lời ~${m.answerTokens ?? 0} token (đếm theo khung stream, thường thấp hơn tổng Ollama báo).`;
+function metricsDetail(m: import("./state").ChatMetrics | undefined, limit: number): string {
+  if (!m || m.outputTokens == null) return "";
+  const vi = (value: number) => value.toLocaleString("vi-VN");
+  const split = outputSplit(m);
+  const lines = [`Output: ${vi(m.outputTokens)} token Lim đã sinh ra ở lượt này (Ollama đếm), trên giới hạn ${vi(m.outputLimit ?? limit)}.`];
+  if (split) lines.push(`Gồm suy nghĩ ~${vi(split.thinking)} và trả lời ~${vi(split.answer)} token (chia theo ước tính khi stream).`, "Lượt sau Lim chỉ nhớ phần trả lời; phần suy nghĩ không được gửi lại nên không chiếm bộ nhớ hội thoại.");
+  if (m.promptTokens != null) lines.push(`Đầu vào lượt này: ${vi(m.promptTokens)} token (system prompt, tóm tắt, hội thoại, câu hỏi).`);
+  return lines.join("\n");
 }
 
 export default function App() {
@@ -130,7 +145,7 @@ export default function App() {
   const [runtimeError, setRuntimeError] = useState("");
   const [running, setRunning] = useState<Record<string, string>>({});
   const [pendingDelete, setPendingDelete] = useState("");
-  const [streamMeta, setStreamMeta] = useState<Record<string, { startedAt: number; chars: number; usage?: RunUsage }>>({});
+  const [streamMeta, setStreamMeta] = useState<Record<string, { startedAt: number; chars: number; usage?: RunUsage; compacting?: boolean }>>({});
   const runLock = useRef(new Set<string>());
   const [vaultPath, setVaultPath] = useState("");
   const [vaultDraft, setVaultDraft] = useState("");
@@ -242,6 +257,14 @@ export default function App() {
       applySessionConfig(session.id, config);
     } catch (error) { setRuntimeError(String(error)); }
   }
+  const [modelMax, setModelMax] = useState<number | null>(null);
+  useEffect(() => {
+    const model = state.preferences.model;
+    if (!native || !model) { setModelMax(null); return; }
+    let live = true;
+    core.modelContext(model).then((limit) => { if (live) setModelMax(limit); }).catch(() => { if (live) setModelMax(null); });
+    return () => { live = false; };
+  }, [state.preferences.model]);
   useEffect(() => { try { localStorage.setItem("lim-inference-open", String(inferenceOpen)); } catch { /* UI remains usable without persistence. */ } }, [inferenceOpen]);
   // Every parameter in the panel is saved on the open session only; other sessions keep theirs.
   async function saveInference(settings: InferenceSettings, size: number) {
@@ -422,6 +445,10 @@ export default function App() {
         if (event.type === "started") setStreamMeta((c) => ({ ...c, [sessionId]: { startedAt: Date.now(), chars: 0 } }));
         if (event.type === "usage" && event.usage) { const usage = event.usage; setStreamMeta((c) => ({ ...c, [sessionId]: { startedAt: c[sessionId]?.startedAt ?? Date.now(), chars: c[sessionId]?.chars ?? 0, usage } })); }
         if (event.type === "text_delta") setStreamMeta((c) => ({ ...c, [sessionId]: { startedAt: c[sessionId]?.startedAt ?? Date.now(), chars: (c[sessionId]?.chars ?? 0) + (event.delta ?? "").length, usage: c[sessionId]?.usage } }));
+        if (event.type === "compacting") setStreamMeta((c) => ({ ...c, [sessionId]: { startedAt: c[sessionId]?.startedAt ?? Date.now(), chars: c[sessionId]?.chars ?? 0, usage: c[sessionId]?.usage, compacting: true } }));
+        if (event.type === "compacted" || event.type === "notice") setStreamMeta((c) => ({ ...c, [sessionId]: { startedAt: Date.now(), chars: 0, usage: c[sessionId]?.usage, compacting: false } }));
+        if (event.type === "compacted" && event.count) setNotice(`Đã thu gọn ${event.count} tin cũ thành bản tóm tắt.`);
+        if (event.type === "notice" && event.notice) setNotice(event.notice);
         if (event.type === "memory_sources" && (event.truncated || event.skippedFiles)) setMemoryStatus("Lượt tìm ghi chú có tệp bỏ qua hoặc đã chạm giới hạn; nguồn có thể chưa đầy đủ.");
         setRunning((c) => ({ ...c, [sessionId]: event.runId }));
         const previousId = currentAssistantId;
@@ -469,6 +496,16 @@ export default function App() {
     setRuntimeError("");
     setState((c) => ({ ...c, sessions: c.sessions.map((s) => s.id !== sessionId ? s : { ...s, messages: s.messages.map((m) => m.id === messageId ? { ...m, status: "running" as const, error: undefined } : m) }) }));
     await streamRun(sessionId, messageId, null, (receive) => core.continueTurn(sessionId, messageId, model, receive));
+  }
+  // Manual "Thu gọn ngay": fold older turns into the session summary, then reload the transcript.
+  async function compactNow() {
+    const sessionId = session.id;
+    try {
+      const count = await core.compactSession(sessionId, state.preferences.model);
+      const snapshot = await core.snapshot();
+      setState((c) => ({ ...c, sessions: c.sessions.map((s) => s.id === sessionId ? snapshot.sessions.find((n) => n.id === sessionId) ?? s : s) }));
+      setNotice(count ? `Đã thu gọn ${count} tin cũ thành bản tóm tắt.` : "Chưa có lượt cũ nào cần thu gọn.");
+    } catch (error) { setRuntimeError(String(error)); }
   }
   async function stop() {
     const runId = running[session.id];
@@ -677,7 +714,7 @@ export default function App() {
           {(
             <header className="topbar">
               <span className="session-title">{session.title}</span>
-              <div className="runtime-hud" aria-label="Cấu hình model hiện tại"><span className="hud-model" title={state.preferences.model}>{state.preferences.model || "Ollama · chưa chọn model"}</span><span className="hud-temperature">temp={effective.temperature.toFixed(2)}</span><ContextMeter usage={contextUsage(session.messages, draft, effective.contextSize, effective.numPredict, effective.systemPrompt)} memory={Boolean(vaultPath)} /></div>
+              <div className="runtime-hud" aria-label="Cấu hình model hiện tại"><span className="hud-model" title={state.preferences.model}>{state.preferences.model || "Ollama · chưa chọn model"}</span><span className="hud-temperature">temp={effective.temperature.toFixed(2)}</span><ContextMeter usage={contextUsage(session, draft, effective.contextSize, effective.numPredict, effective.systemPrompt)} memory={Boolean(vaultPath)} autoCompact={effective.autoCompact} onCompact={native && ready && !running[session.id] && state.preferences.model ? compactNow : undefined} /></div>
               <button className={`icon-button inference-toggle ${inferenceDirty ? "has-draft" : ""}`} aria-label={inferenceDirty ? "Tham số chạy model · có thay đổi chưa áp dụng" : "Tham số chạy model"} title="Tham số chạy model" aria-expanded={inferenceOpen} aria-controls="inference-heading" onClick={() => setInferenceOpen((open) => !open)}><Settings2 size={17} /></button>
             </header>
           )}
@@ -737,7 +774,8 @@ export default function App() {
                         const meta = streamMeta[session.id];
                         const liveSpeed = isRunning && !isUser && meta ? liveUsage(meta) : "";
                         return (
-                        <article className={`message ${m.role}`} key={m.id}>
+                        <Fragment key={m.id}>
+                        <article className={`message ${m.role}`}>
                           <span className="message-avatar" aria-hidden="true">
                             {isUser ? "B" : <Logo />}
                           </span>
@@ -766,7 +804,7 @@ export default function App() {
                               {m.id === session.messages[session.messages.length - 1]?.id && <button className="secondary-button" disabled={!ready || !native || Boolean(running[session.id])} title={native ? "Viết tiếp câu trả lời với giới hạn output mới" : "Mở app desktop để tiếp tục"} onClick={() => void continueAnswer(m.id)}><Play size={13} aria-hidden="true" />Tiếp tục (+{effective.numPredict.toLocaleString("vi-VN")} token)</button>}</div>}
                             {m.status && m.status !== "completed" && m.status !== "truncated" && !isUser && <small className="message-status">{{ running: liveSpeed || "Đang trả lời", cancelled: "Đã dừng · câu trả lời chưa hoàn tất", failed: m.error ? `Lượt chạy bị lỗi: ${m.error}` : "Lượt chạy bị lỗi", interrupted: "Bị gián đoạn khi đóng ứng dụng" }[m.status]}</small>}
                             {!isUser && m.metrics && (m.status === "completed" || m.status === "truncated") && formatMetrics(m.metrics, effective.numPredict) && (
-                              <small className="message-metrics" title={metricsDetail(m.metrics)}>{formatMetrics(m.metrics, effective.numPredict)}</small>
+                              <small className="message-metrics" title={metricsDetail(m.metrics, effective.numPredict)}>{formatMetrics(m.metrics, effective.numPredict)}</small>
                             )}
                             {!!m.sources?.length && <details className="message-sources"><summary>Nguồn ghi chú ({m.sources.length})</summary>{m.sources.map((source, i) => <div key={source.path}><strong>[vault:{i + 1}] {source.title}</strong><small>{source.path}</small><p>{source.excerpt}</p></div>)}</details>}
                             <button
@@ -779,6 +817,11 @@ export default function App() {
                             </button>
                           </div>
                         </article>
+                        {m.id === session.summaryUntil && session.summary && <details className="compact-divider">
+                          <summary>Đã thu gọn {session.messages.findIndex((x) => x.id === m.id) + 1} tin phía trên thành bản tóm tắt</summary>
+                          <p>{session.summary}</p>
+                        </details>}
+                        </Fragment>
                         );
                       })}
                       <div ref={messageEnd} />
@@ -1006,7 +1049,7 @@ export default function App() {
                     <button className="secondary-button" disabled={!native || !ready} onClick={() => void refreshModels()}>Tải lại danh sách</button>
                     <button className="secondary-button" onClick={() => setPage("cookbook")}>Mở Cookbook</button>
                     <p className="settings-status" role="status">{modelError || "Ollama tại 127.0.0.1:11434. Model và hội thoại được lưu bởi lõi desktop."}</p>
-                    <div className="field-row"><label htmlFor="context-size">Context</label><select id="context-size" value={effective.contextSize} disabled={!native || !ready} onChange={(e) => void chooseContext(Number(e.target.value))}><option value={4096}>4K · tiết kiệm bộ nhớ</option><option value={8192}>8K</option><option value={16384}>16K · cần thêm RAM/VRAM</option></select></div>
+                    <div className="field-row"><label htmlFor="context-size">Context</label><select id="context-size" value={effective.contextSize} disabled={!native || !ready} onChange={(e) => void chooseContext(Number(e.target.value))}>{[4096, 8192, 16384, 32768, 65536, 131072].filter((size) => !modelMax || size <= modelMax || size === effective.contextSize).map((size) => <option key={size} value={size}>{size / 1024}K{size === 4096 ? " · tiết kiệm bộ nhớ" : size >= 32768 ? " · cần nhiều RAM/VRAM" : ""}</option>)}</select></div>
                   </section>
                   <section className="settings-section">
                     <h2>Bộ nhớ Obsidian</h2>
@@ -1018,7 +1061,7 @@ export default function App() {
               </>
             </FloatingWindow>
           </main>
-          <InferencePanel key={session.id} sessionTitle={session.title} open={inferenceOpen} settings={panelSettings} contextSize={effective.contextSize} model={state.preferences.model} ready={ready} onDirty={setInferenceDirty} onSave={saveInference} onClose={() => setInferenceOpen(false)} />
+          <InferencePanel key={session.id} sessionTitle={session.title} modelMax={modelMax} open={inferenceOpen} settings={panelSettings} contextSize={effective.contextSize} model={state.preferences.model} ready={ready} onDirty={setInferenceDirty} onSave={saveInference} onClose={() => setInferenceOpen(false)} />
           </div>
         </div>
       </div>
