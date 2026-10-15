@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowDown, ArrowRight, ArrowUp, Box, Check, Cpu, Download, ExternalLink, Flame, Globe, HardDrive, RefreshCw, Search, Settings, Square, Unplug, X } from "lucide-react";
+import { ArrowDown, ArrowRight, ArrowUp, Box, Check, Cpu, Download, ExternalLink, Flame, Globe, HardDrive, RefreshCw, Search, Settings, Square, Trash2, Unplug, X } from "lucide-react";
 import { native } from "./core";
 import { cookbook } from "./cookbook-api";
 import type { CookbookSnapshot, InstalledModel, SetupEvent } from "./cookbook-api";
@@ -26,9 +26,9 @@ const providerOf = (id: string, entry?: CatalogModel) => entry?.provider ?? (id.
 const providerLabels = { ollama: "Ollama", huggingface: "Hugging Face" };
 const compact = (value: number) => new Intl.NumberFormat("vi-VN", { notation: "compact", maximumFractionDigits: 1 }).format(value);
 
-export default function Cookbook({ visible, selectedModel, contextSize, chatBusy, onSelected, onContext, onChat }: {
+export default function Cookbook({ visible, selectedModel, contextSize, chatBusy, onSelected, onDeleted, onContext, onChat }: {
   visible: boolean; selectedModel: string; contextSize: number; chatBusy: boolean;
-  onSelected: (model: string, context: number) => void; onContext: (context: number) => void; onChat: () => void;
+  onSelected: (model: string, context: number) => void; onDeleted: (model: string) => void; onContext: (context: number) => void; onChat: () => void;
 }) {
   const [snapshot, setSnapshot] = useState<CookbookSnapshot | null>(null);
   const [catalog, setCatalog] = useState<CatalogSnapshot>(BUNDLED_CATALOG);
@@ -51,6 +51,7 @@ export default function Cookbook({ visible, selectedModel, contextSize, chatBusy
   const [descending, setDescending] = useState(false);
   const [detailId, setDetailId] = useState("");
   const [operation, setOperation] = useState<SetupEvent | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState("");
   const [working, setWorking] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const actionLock = useRef(false);
@@ -163,6 +164,19 @@ export default function Cookbook({ visible, selectedModel, contextSize, chatBusy
     try { await cookbook.unload(model); await refresh(); }
     catch (failure) { setError(String(failure)); }
     finally { actionLock.current = false; setWorking(false); }
+  }
+
+  async function remove(model: string) {
+    if (actionLock.current || chatBusy || !native) return;
+    actionLock.current = true;
+    setWorking(true); setError(""); setOperation(null);
+    try {
+      await cookbook.remove(model);
+      setDeleteTarget("");
+      onDeleted(model);
+      await refresh();
+    } catch (failure) { if (alive.current) setError(String(failure)); }
+    finally { actionLock.current = false; if (alive.current) setWorking(false); }
   }
 
   const hw = snapshot?.hardware;
@@ -314,7 +328,7 @@ export default function Cookbook({ visible, selectedModel, contextSize, chatBusy
                 <td><button className="cookbook-model-name" aria-expanded={detailId === row.id} onClick={() => setDetailId(detailId === row.id ? "" : row.id)}><Cpu size={13} /><span>{row.id}</span>{selectedModel === row.id ? <Check size={12} aria-label="Đang chọn" /> : row.local ? <span className="cookbook-installed-dot" aria-label="Đã tải" /> : null}</button></td>
                 <td>{tab === "active" ? memory(live?.sizeVramBytes) : rowMemory(row) == null ? "—" : `${rowMemory(row)!.toFixed(1)}${row.catalog ? "*" : "†"}`}</td>
                 <td>{rowParams(row)}</td><td>{rowQuant(row)}</td><td title={`Context đang chọn ${contextSize}; tối đa công bố ${row.catalog?.maxContext ?? "chưa rõ"}`}>{live?.contextLength ? `${live.contextLength / 1024}K` : `${Math.min(contextSize, row.catalog?.maxContext ?? contextSize) / 1024}K*`}</td><td title={observation(row) ? `Lượt chat ${observation(row)!.measuredAt}, context ${contextSize}; tốc độ eval Ollama` : "Chưa có lượt chat được ghi nhận ở context này"}>{observation(row)?.tokensPerSecond.toFixed(1) ?? "—"}{observation(row) ? " t/s" : ""}</td><td title="Điểm phù hợp bộ nhớ, không phải chất lượng model">{fit?.score ?? "—"}</td><td title={row.catalog?.downloads != null ? `${row.catalog.downloads.toLocaleString("vi-VN")} lượt tải trên Hugging Face; chạy qua Ollama` : "Thư viện Ollama"}>{providerOf(row.id, row.catalog) === "huggingface" ? `HF${row.catalog?.downloads != null ? ` · ${compact(row.catalog.downloads)}` : ""}` : "Ollama"}</td>
-                <td className="cookbook-row-actions">{tab === "active" ? <button className="secondary-button" aria-label={`Giải phóng ${row.id}`} disabled={disabled} onClick={() => void unload(row.id)}><Unplug size={13} />Unload</button> : tab === "launch" ? <button className="secondary-button" disabled={disabled || embedding(row)} title={embedding(row) ? "Embedding dùng cho memory; chưa có luồng chat cho model này" : "Nạp và chọn cho hội thoại"} onClick={() => void setup(row.id)}>Run <ArrowRight size={12} /></button> : <button className="secondary-button" disabled={disabled || Boolean(row.local)} onClick={() => void setup(row.id, true)}>{row.local ? <Check size={12} /> : <Download size={12} />}{row.local ? "Đã tải" : "Download"}</button>}</td>
+                <td className="cookbook-row-actions">{tab === "active" ? <button className="secondary-button" aria-label={`Giải phóng ${row.id}`} disabled={disabled} onClick={() => void unload(row.id)}><Unplug size={13} />Unload</button> : tab === "launch" ? <button className="secondary-button" disabled={disabled || embedding(row)} title={embedding(row) ? "Embedding dùng cho memory; chưa có luồng chat cho model này" : "Nạp và chọn cho hội thoại"} onClick={() => void setup(row.id)}>Run <ArrowRight size={12} /></button> : <button className="secondary-button" disabled={disabled || Boolean(row.local)} onClick={() => void setup(row.id, true)}>{row.local ? <Check size={12} /> : <Download size={12} />}{row.local ? "Đã tải" : "Download"}</button>}{row.local && <button className="secondary-button" aria-label={`Xoá ${row.local.name}`} disabled={disabled} onClick={() => setDeleteTarget(row.local!.name)}><Trash2 size={13} />Xoá</button>}</td>
               </tr>;
             })}</tbody>
           </table>
@@ -347,6 +361,11 @@ export default function Cookbook({ visible, selectedModel, contextSize, chatBusy
         <div className="cookbook-setting-row"><div><strong>Cấu hình phát hiện</strong><p>{hw?.cpu ?? "CPU chưa xác định"}</p>{hw?.notes.map((note) => <p key={note}>{note}</p>)}</div></div>
       </section>}
     </div>
+    {deleteTarget && <div className="cookbook-delete-confirm" role="group" aria-label="Xác nhận xoá model">
+      <p>Xoá <strong>{deleteTarget}</strong> khỏi máy? Cần tải lại để dùng model này.</p>
+      <button autoFocus className="secondary-button" disabled={working} onClick={() => setDeleteTarget("")}>Huỷ</button>
+      <button className="secondary-button" disabled={disabled} onClick={() => void remove(deleteTarget)}>{working ? "Đang xoá…" : "Xác nhận xoá"}</button>
+    </div>}
     <footer className="cookbook-statusbar"><span><span className={`cookbook-dot ${snapshot?.ollamaAvailable ? "connected" : ""}`} />{snapshot?.ollamaAvailable ? "Ollama connected" : "Ollama chưa kết nối"}</span><button onClick={onChat}>{selectedModel || "Chưa chọn model"}{selectedModel && <span> · {selectedReady ? "ready" : "chưa nạp"}</span>}<ArrowRight size={11} /></button></footer>
   </section>;
 }

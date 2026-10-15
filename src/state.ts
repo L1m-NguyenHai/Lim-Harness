@@ -19,7 +19,7 @@ export type Message = {
   runId?: string;
   /** "truncated": stopped at the output limit; can be continued. */
   status?: "running" | "completed" | "truncated" | "cancelled" | "failed" | "interrupted";
-  sources?: { path: string; title: string; excerpt: string }[];
+  sources?: { path: string; title: string; excerpt: string; memoryId?: string; revision?: string }[];
   model?: string;
   thinking?: string;
   metrics?: ChatMetrics;

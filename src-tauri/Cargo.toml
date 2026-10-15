@@ -23,4 +23,6 @@ tokio = { version = "1", features = ["sync", "time", "macros"] }
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde_yaml = "0.9"
+unicode-normalization = "0.1"
 
