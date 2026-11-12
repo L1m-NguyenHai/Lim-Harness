@@ -60,6 +60,9 @@ pub(crate) struct Counts {
     thinking: u64,
     answer: u64,
     budget: u64,
+    /// Agent mode collects tool calls instead of rejecting them.
+    agent: bool,
+    tool_calls: Vec<Value>,
 }
 impl Counts {
     fn usage(&self) -> Value {
@@ -81,6 +84,8 @@ pub struct Runtime {
     active: Mutex<HashMap<String, ActiveRun>>,
     pub(crate) client: reqwest::Client,
     pub(crate) model_gate: Arc<RwLock<()>>,
+    /// Agent steps waiting for the user's Allow/Deny, keyed by approval id.
+    approvals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
 }
 impl Runtime {
     pub fn new(store: Store) -> Result<Self, String> {
@@ -95,6 +100,7 @@ impl Runtime {
             active: Mutex::new(HashMap::new()),
             client,
             model_gate: Arc::new(RwLock::new(())),
+            approvals: Mutex::new(HashMap::new()),
         })
     }
 }
@@ -484,13 +490,17 @@ async fn generate(
         compact_with_events(runtime, session, model, context_size, settings, info.as_ref(), false, channel, run, session, sequence).await;
     }
     let (summary, until) = runtime.store.session_summary(session)?;
-    let system = system_with_summary(&settings.system_prompt, summary.as_deref());
+    let mut system = system_with_summary(&settings.system_prompt, summary.as_deref());
+    if settings.agent_mode {
+        system = format!("{system}\n\n{}", crate::agent::instructions()).trim().to_string();
+    }
     let mut history = Vec::new();
     if !system.is_empty() {
         history.push(json!({"role":"system","content":system}));
     }
     let mut history_budget = input_budget(context_size, settings)
-        .saturating_sub(summary.as_deref().map_or(0, |s| estimate_tokens(&summary_block(s))));
+        .saturating_sub(summary.as_deref().map_or(0, |s| estimate_tokens(&summary_block(s))))
+        .saturating_sub(if settings.agent_mode { estimate_tokens(&crate::agent::instructions()) + 600 } else { 0 });
     // Notes get at most 4.500 bytes and never the room the new message needs.
     let memory_budget = history_budget.saturating_sub(estimate_tokens(text) + 16).saturating_mul(3).min(4_500);
     let path = runtime.store.setting("vault")?;
@@ -539,11 +549,183 @@ async fn generate(
     // One output limit shared by thinking and answer; Ollama counts it exactly.
     options["num_predict"] = json!(settings.num_predict);
     let request = json!({"model":model,"messages":history,"stream":true,"options":options});
-    let mut counts = Counts { thinking: 0, answer: 0, budget: settings.num_predict as u64 };
+    let tools_capable = info.as_ref().is_some_and(|i| i["capabilities"].as_array().is_some_and(|c| c.iter().any(|v| v == "tools")));
+    if settings.agent_mode {
+        if !tools_capable {
+            return Err(format!("Model {model} không hỗ trợ gọi công cụ nên không chạy được chế độ Agent. Chọn model có khả năng tools (ví dụ qwen3, qwen3.5, llama3.1)."));
+        }
+        return agent_loop(runtime, session, run, model, history, options, crate::agent::tool_specs(), context_size, settings, info.as_ref(), assistant, channel, sequence, content, thinking, metrics).await;
+    }
+    // Normal chat on a tools-capable model goes through the same loop with only the local
+    // clock tool: that alone keeps Qwen-style reasoning short on simple prompts.
+    if tools_capable {
+        return agent_loop(runtime, session, run, model, history, options, crate::agent::chat_tool_specs(), context_size, settings, info.as_ref(), assistant, channel, sequence, content, thinking, metrics).await;
+    }
+    let mut counts = Counts { thinking: 0, answer: 0, budget: settings.num_predict as u64, agent: false, tool_calls: Vec::new() };
     let _ = emit(channel, run, session, sequence, counts.usage());
     let step = stream_chat(runtime, &request, assistant, channel, run, session, sequence, content, thinking, metrics, model, context_size, &mut counts).await?;
     let _ = emit(channel, run, session, sequence, counts.usage());
     outcome(step, content)
+}
+/// Answer from the user's Allow/Deny on an agent step.
+#[tauri::command]
+pub fn resolve_approval(state: State<'_, Arc<Runtime>>, approval_id: String, allow: bool) -> Result<bool, String> {
+    let sender = state.approvals.lock().map_err(|_| "Runtime không khả dụng")?.remove(&approval_id);
+    Ok(sender.is_some_and(|sender| sender.send(allow).is_ok()))
+}
+/// Agent mode: Ollama tool calling in a loop. Each round streams the model; tool calls are
+/// executed (risky ones after the user's approval) and their results appended as `tool`
+/// messages, until the model answers without tools or MAX_STEPS is reached.
+#[allow(clippy::too_many_arguments)]
+async fn agent_loop(
+    runtime: &Runtime,
+    session: &str,
+    run: &str,
+    model: &str,
+    mut messages: Vec<Value>,
+    options: Value,
+    tools: Value,
+    context_size: usize,
+    settings: &InferenceSettings,
+    info: Option<&Value>,
+    assistant: &mut Message,
+    channel: &Channel<Value>,
+    sequence: &mut u64,
+    content: &mut String,
+    thinking: &mut String,
+    metrics: &mut Option<crate::storage::ChatMetrics>,
+) -> Result<bool, String> {
+    let client = crate::agent::client()?;
+    let budget_bytes = input_budget(context_size, settings) * 3;
+    // Each tool result is capped; old results shrink when they crowd the window.
+    let cap = (budget_bytes / 3).clamp(1_500, 6_000);
+    let mut steps: Vec<Value> = assistant.steps.clone().unwrap_or_default();
+    let mut counts = Counts { thinking: 0, answer: 0, budget: settings.num_predict as u64, agent: true, tool_calls: Vec::new() };
+    let mut total_output = 0u64;
+    // After a denial the next round gets no tools, so the model answers instead of retrying.
+    let mut force_answer = false;
+    let thinks = info.is_some_and(|i| i["capabilities"].as_array().is_some_and(|c| c.iter().any(|v| v == "thinking")));
+    let _ = emit(channel, run, session, sequence, counts.usage());
+    // Agent mode starts every new turn by checking the clock, so questions about "current"
+    // facts are searched and dated against today rather than the model's training cutoff.
+    // A continued answer already has it.
+    if settings.agent_mode && steps.is_empty() {
+        let args = json!({});
+        let now = crate::agent::run(&client, "current_time", &args, cap).await?;
+        let step = json!({"id":Uuid::new_v4().to_string(),"tool":"current_time","title":crate::agent::title("current_time", &args),"args":args,"status":"done","output":now});
+        let _ = emit(channel, run, session, sequence, json!({"type":"agent_step","step":step}));
+        steps.push(step);
+        messages.push(json!({"role":"assistant","content":"","tool_calls":[{"function":{"name":"current_time","arguments":{}}}]}));
+        messages.push(json!({"role":"tool","tool_name":"current_time","content":now}));
+        // A question about the present is searched right away, dated with the current year.
+        let question = messages.iter().rev().find(|m| m["role"] == "user").and_then(|m| m["content"].as_str()).unwrap_or_default().to_string();
+        if crate::agent::time_sensitive(&question) {
+            let args = json!({"query": crate::agent::dated_query(&question)});
+            let mut step = json!({"id":Uuid::new_v4().to_string(),"tool":"web_search","title":crate::agent::title("web_search", &args),"args":args,"status":"running","output":""});
+            let _ = emit(channel, run, session, sequence, json!({"type":"agent_step","step":step}));
+            let (status, result) = match crate::agent::run(&client, "web_search", &args, cap).await {
+                Ok(text) => ("done", text),
+                Err(error) => ("error", format!("Lỗi: {error}")),
+            };
+            step["status"] = json!(status);
+            step["output"] = json!(crate::agent::truncate(&result, 4_000));
+            let _ = emit(channel, run, session, sequence, json!({"type":"agent_step","step":step}));
+            steps.push(step);
+            messages.push(json!({"role":"assistant","content":"","tool_calls":[{"function":{"name":"web_search","arguments":args}}]}));
+            messages.push(json!({"role":"tool","tool_name":"web_search","content":result}));
+        }
+    }
+    for round in 0..=crate::agent::MAX_STEPS {
+        let last_round = round == crate::agent::MAX_STEPS || force_answer;
+        let mut request = json!({"model":model,"messages":messages,"stream":true,"options":options});
+        // The final round has no tools so the model must answer with what it has.
+        if !last_round {
+            request["tools"] = tools.clone();
+        }
+        let before = content.len();
+        let step = stream_chat(runtime, &request, assistant, channel, run, session, sequence, content, thinking, metrics, model, context_size, &mut counts).await?;
+        total_output += metrics.as_ref().and_then(|m| m.output_tokens).unwrap_or(0);
+        let calls = std::mem::take(&mut counts.tool_calls);
+        let mut step = step;
+        // Small models sometimes write the final answer inside an unclosed reasoning block, so
+        // Ollama returns it as thinking with empty content. Ask once more for the answer only.
+        if (calls.is_empty() || last_round) && matches!(step, Step::Done) && content[before..].trim().is_empty() {
+            let mut retry = json!({"model":model,"messages":messages,"stream":true,"options":options});
+            if thinks {
+                retry["think"] = json!(false);
+            }
+            step = stream_chat(runtime, &retry, assistant, channel, run, session, sequence, content, thinking, metrics, model, context_size, &mut counts).await?;
+            total_output += metrics.as_ref().and_then(|m| m.output_tokens).unwrap_or(0);
+            counts.tool_calls.clear();
+        }
+        if calls.is_empty() || last_round || matches!(step, Step::Length) {
+            if let Some(m) = metrics.as_mut() {
+                m.output_tokens = Some(total_output);
+            }
+            assistant.steps = (!steps.is_empty()).then(|| steps.clone());
+            let _ = emit(channel, run, session, sequence, counts.usage());
+            return outcome(step, content);
+        }
+        messages.push(json!({"role":"assistant","content":content[before..].to_string(),"tool_calls":calls}));
+        for call in calls {
+            let tool = call["function"]["name"].as_str().unwrap_or_default().to_string();
+            let args = crate::agent::arguments(&call);
+            let id = Uuid::new_v4().to_string();
+            let approval = crate::agent::needs_approval(&tool);
+            let mut entry = json!({"id":id,"tool":tool,"title":crate::agent::title(&tool, &args),"args":args,"status":if approval { "waiting" } else { "running" },"output":""});
+            steps.push(entry.clone());
+            let index = steps.len() - 1;
+            // Once the user denied something this round, further risky calls are denied too.
+            let allowed = if approval && force_answer {
+                false
+            } else if approval {
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                runtime.approvals.lock().map_err(|_| "Runtime không khả dụng")?.insert(id.clone(), sender);
+                entry["approvalId"] = json!(id);
+                steps[index] = entry.clone();
+                let _ = emit(channel, run, session, sequence, json!({"type":"agent_step","step":entry}));
+                let answer = tokio::time::timeout(Duration::from_secs(600), receiver).await;
+                if let Ok(mut pending) = runtime.approvals.lock() {
+                    pending.remove(&id);
+                }
+                matches!(answer, Ok(Ok(true)))
+            } else {
+                let _ = emit(channel, run, session, sequence, json!({"type":"agent_step","step":entry}));
+                true
+            };
+            let (status, result) = if !allowed {
+                force_answer = true;
+                ("denied", "Người dùng đã từ chối thao tác này. Không thử lại; hãy trả lời với thông tin hiện có hoặc hỏi người dùng.".to_string())
+            } else {
+                entry["status"] = json!("running");
+                let _ = emit(channel, run, session, sequence, json!({"type":"agent_step","step":entry}));
+                match crate::agent::run(&client, &tool, &args, cap).await {
+                    Ok(text) => ("done", text),
+                    Err(error) => ("error", format!("Lỗi: {error}")),
+                }
+            };
+            entry["status"] = json!(status);
+            entry["output"] = json!(crate::agent::truncate(&result, 4_000));
+            entry.as_object_mut().map(|o| o.remove("approvalId"));
+            steps[index] = entry.clone();
+            let _ = emit(channel, run, session, sequence, json!({"type":"agent_step","step":entry}));
+            messages.push(json!({"role":"tool","tool_name":tool,"content":result}));
+        }
+        // Keep tool results within ~60% of the input budget: shrink the oldest first.
+        let mut tool_bytes: usize = messages.iter().filter(|m| m["role"] == "tool").map(|m| m["content"].as_str().map_or(0, str::len)).sum();
+        for message in messages.iter_mut().filter(|m| m["role"] == "tool") {
+            if tool_bytes * 10 <= budget_bytes * 6 {
+                break;
+            }
+            let size = message["content"].as_str().map_or(0, str::len);
+            message["content"] = json!("[Kết quả cũ đã được rút gọn để tiết kiệm context]");
+            tool_bytes = tool_bytes.saturating_sub(size);
+        }
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push_str("\n\n");
+        }
+    }
+    unreachable!("the last round always returns")
 }
 /// Ok(true): stopped at the output limit (the answer can be continued); Ok(false): finished.
 fn outcome(step: Step, content: &str) -> Result<bool, String> {
@@ -662,6 +844,8 @@ async fn continue_generate(
         thinking: previous.as_ref().and_then(|m| m.thinking_tokens).unwrap_or(0),
         answer: previous.as_ref().and_then(|m| m.answer_tokens).unwrap_or(0),
         budget: granted_before + num_predict as u64,
+        agent: false,
+        tool_calls: Vec::new(),
     };
     let _ = emit(channel, run, session, sequence, counts.usage());
     let step = stream_from(runtime, path, &request, split.as_mut(), assistant, channel, run, session, sequence, content, thinking, metrics, model, context_size, &mut counts).await?;
@@ -975,13 +1159,11 @@ fn consume(
             error.chars().take(300).collect::<String>()
         ));
     }
-    if frame["message"]["tool_calls"]
-        .as_array()
-        .is_some_and(|a| !a.is_empty())
-    {
-        return Err(
-            "Model yêu cầu tool call; executor chưa được bật trong lõi hội thoại hiện tại.".into(),
-        );
+    if let Some(calls) = frame["message"]["tool_calls"].as_array().filter(|a| !a.is_empty()) {
+        if !counts.agent {
+            return Err("Model yêu cầu dùng công cụ; bật chế độ Agent để cho phép.".into());
+        }
+        counts.tool_calls.extend(calls.iter().cloned());
     }
     // Reasoning streams: Ollama thinking models expose `message.thinking`
     // (some builds use `message.reasoning` or top-level `thinking`).
@@ -1187,7 +1369,7 @@ mod live_tests {
 mod history_tests {
     use super::*;
     fn msg(role: &str, text: &str, status: &str) -> Message {
-        Message { id: Uuid::new_v4().to_string(), role: role.into(), text: text.into(), source: if role == "user" { "user".into() } else { "model".into() }, run_id: None, status: Some(status.into()), sources: None, model: None, thinking: None, metrics: None, error: None }
+        Message { id: Uuid::new_v4().to_string(), role: role.into(), text: text.into(), source: if role == "user" { "user".into() } else { "model".into() }, run_id: None, status: Some(status.into()), sources: None, model: None, thinking: None, metrics: None, error: None, steps: None }
     }
     #[test]
     fn drops_unanswered_questions() {
@@ -1264,5 +1446,115 @@ mod compaction_tests {
         assert!(kept.len() >= 2 && kept[0].role == "user", "newest turns stay verbatim, starting at a question");
         drop(runtime);
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+#[cfg(test)]
+mod agent_live_tests {
+    use super::*;
+    /// Runs one agent turn; `approve` auto-answers approval requests like the UI buttons would.
+    fn agent_turn(prompt: &str, approve: bool) -> (Result<bool, String>, String, Vec<Value>) {
+        let dir = std::env::temp_dir().join(format!("lim-agent-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runtime = Runtime::new(crate::storage::Store::open(&dir.join("t.sqlite3")).unwrap()).unwrap();
+        let session = runtime.store.create_session().unwrap().id;
+        let run = Uuid::new_v4().to_string();
+        let model = "qwen3.5:2b";
+        let (_, mut assistant) = runtime.store.begin(&session, &run, model, prompt).unwrap();
+        let channel: Channel<Value> = Channel::new(|_| Ok(()));
+        let settings = InferenceSettings { agent_mode: true, num_predict: 1536, ..Default::default() };
+        let (mut sequence, mut content, mut thinking, mut metrics) = (0, String::new(), String::new(), None);
+        let result = tauri::async_runtime::block_on(async {
+            let answer = async {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let pending: Vec<String> = runtime.approvals.lock().unwrap().keys().cloned().collect();
+                    for id in pending {
+                        if let Some(sender) = runtime.approvals.lock().unwrap().remove(&id) {
+                            println!("  approval requested -> {}", if approve { "allow" } else { "deny" });
+                            let _ = sender.send(approve);
+                        }
+                    }
+                }
+            };
+            tokio::select! {
+                result = generate(&runtime, &session, &run, model, prompt, 8192, &settings, &mut assistant, &channel, &mut sequence, &mut content, &mut thinking, &mut metrics) => result,
+                _ = answer => unreachable!(),
+            }
+        });
+        let steps = assistant.steps.clone().unwrap_or_default();
+        println!("  thinking {} chars, tail: {:?}", thinking.len(), thinking.chars().rev().take(300).collect::<Vec<_>>().into_iter().rev().collect::<String>());
+        println!("  metrics {:?}", metrics.as_ref().map(|m: &crate::storage::ChatMetrics| (m.output_tokens, m.thinking_tokens, m.answer_tokens)));
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(&dir);
+        (result, content, steps)
+    }
+    fn show(steps: &[Value]) {
+        for step in steps {
+            println!("  - [{}] {} -> {}", step["status"].as_str().unwrap_or(""), step["title"].as_str().unwrap_or(""), step["output"].as_str().unwrap_or("").chars().take(120).collect::<String>().replace('\n', " | "));
+        }
+    }
+    /// `cargo test --lib agent_web -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn agent_web() {
+        let (result, answer, steps) = agent_turn("Hãy tìm trên web: thủ đô của nước Úc là thành phố nào? Trả lời một câu và ghi nguồn.", false);
+        show(&steps);
+        println!("result {result:?}\nanswer: {answer}");
+        assert!(steps.iter().any(|s| s["tool"] == "web_search" && s["status"] == "done"));
+        assert!(result.is_ok() && !answer.trim().is_empty());
+    }
+    /// `cargo test --lib agent_current_facts -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn agent_current_facts() {
+        let (result, answer, steps) = agent_turn("check giúp tôi ai là tổng thống mỹ hiện tại", false);
+        show(&steps);
+        println!("result {result:?}
+answer: {answer}");
+        assert_eq!(steps.first().map(|s| s["tool"].clone()), Some(json!("current_time")), "agent turns start by checking the clock");
+        assert!(steps.iter().any(|s| s["tool"] == "web_search"), "a 'current' question must be searched");
+        assert!(result.is_ok());
+    }
+    /// `cargo test --lib agent_terminal -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn agent_terminal() {
+        let (result, answer, steps) = agent_turn("Dùng lệnh terminal để cho tôi biết phiên bản PowerShell trên máy (lệnh $PSVersionTable.PSVersion).", true);
+        show(&steps);
+        println!("result {result:?}\nanswer: {answer}");
+        assert!(steps.iter().any(|s| s["tool"] == "run_command" && s["status"] == "done"));
+        let (_, _, denied) = agent_turn("Chạy lệnh terminal: Get-Date", false);
+        show(&denied);
+        assert!(denied.iter().any(|s| s["tool"] == "run_command" && s["status"] == "denied"));
+    }
+}
+#[cfg(test)]
+mod chat_live_tests {
+    use super::*;
+    /// `cargo test --lib chat_greeting_is_short -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn chat_greeting_is_short() {
+        let mut outputs = Vec::new();
+        for _ in 0..3 {
+            let dir = std::env::temp_dir().join(format!("lim-chat-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let runtime = Runtime::new(crate::storage::Store::open(&dir.join("t.sqlite3")).unwrap()).unwrap();
+            let session = runtime.store.create_session().unwrap().id;
+            let run = Uuid::new_v4().to_string();
+            let (_, mut assistant) = runtime.store.begin(&session, &run, "qwen3.5:2b", "chào cậu").unwrap();
+            let channel: Channel<Value> = Channel::new(|_| Ok(()));
+            let settings = InferenceSettings::default();
+            let (mut sequence, mut content, mut thinking, mut metrics) = (0, String::new(), String::new(), None);
+            let result = tauri::async_runtime::block_on(generate(&runtime, &session, &run, "qwen3.5:2b", "chào cậu", 4096, &settings, &mut assistant, &channel, &mut sequence, &mut content, &mut thinking, &mut metrics));
+            let out = metrics.as_ref().and_then(|m: &crate::storage::ChatMetrics| m.output_tokens).unwrap_or(0);
+            println!("result {result:?} · output {out} · steps {} · answer {:?}", assistant.steps.as_ref().map_or(0, Vec::len), content.chars().take(60).collect::<String>());
+            assert_eq!(result, Ok(false));
+            outputs.push(out);
+            drop(runtime);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        outputs.sort();
+        assert!(outputs[1] < 600, "median output should stay small, got {outputs:?}");
     }
 }

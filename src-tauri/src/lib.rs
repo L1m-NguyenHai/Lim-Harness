@@ -1,6 +1,8 @@
+mod agent;
 mod catalog;
 mod cookbook;
 mod runtime;
+mod searxng;
 mod storage;
 mod vault;
 use std::sync::Arc;
@@ -17,6 +19,8 @@ pub fn run() {
             let runtime = runtime::Runtime::new(store).map_err(std::io::Error::other)?;
             app.manage(Arc::new(runtime));
             app.manage(Arc::new(cookbook::Cookbook::new()));
+            // Local SearXNG for agent web search lives as long as the app (see searxng.rs).
+            std::thread::spawn(searxng::start);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -33,6 +37,7 @@ pub fn run() {
             runtime::list_models,
             runtime::start_turn,
             runtime::continue_turn,
+            runtime::resolve_approval,
             runtime::compact_session,
             runtime::model_context,
             runtime::cancel_turn,
@@ -43,6 +48,11 @@ pub fn run() {
             catalog::get_model_catalog,
             catalog::search_model_catalog
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run Lim Harness");
+        .build(tauri::generate_context!())
+        .expect("failed to build Lim Harness")
+        .run(|_app, event| {
+            if let tauri::RunEvent::Exit = event {
+                searxng::stop();
+            }
+        });
 }

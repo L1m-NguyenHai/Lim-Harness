@@ -9,15 +9,15 @@ export type VaultSearchResult = {
   skippedFiles: number;
   truncated: boolean;
 };
-export type InferenceSettings = { systemPrompt: string; temperature: number; topP: number; topK: number; repeatPenalty: number; numPredict: number; seed: number | null; autoCompact: boolean };
+export type InferenceSettings = { systemPrompt: string; temperature: number; topP: number; topK: number; repeatPenalty: number; numPredict: number; seed: number | null; autoCompact: boolean; agentMode: boolean };
 export type RunUsage = { thinkingTokens: number; answerTokens: number; budget: number };
 export const defaultInference: InferenceSettings = {
   systemPrompt: "Bạn là Lim, trợ lý AI chạy trên máy của người dùng. Mặc định trả lời bằng tiếng Việt, tự nhiên và ngắn gọn. Bạn chỉ trò chuyện bằng văn bản, không chạy lệnh và không đọc hay sửa tệp.",
-  temperature: 0.7, topP: 0.9, topK: 40, repeatPenalty: 1.1, numPredict: 2048, seed: null, autoCompact: true,
+  temperature: 0.7, topP: 0.9, topK: 40, repeatPenalty: 1.1, numPredict: 2048, seed: null, autoCompact: true, agentMode: false,
 };
 export type Snapshot = { sessions: Session[]; model: string; vaultPath: string; contextSize: number; inferenceSettings: InferenceSettings };
 export type RunEvent = {
-  type: "started" | "text_delta" | "thinking_delta" | "metrics" | "memory_sources" | "usage" | "compacting" | "compacted" | "notice" | "completed" | "truncated" | "cancelled" | "failed";
+  type: "started" | "text_delta" | "thinking_delta" | "metrics" | "memory_sources" | "usage" | "compacting" | "compacted" | "notice" | "agent_step" | "completed" | "truncated" | "cancelled" | "failed";
   sessionId: string;
   runId: string;
   sequence: number;
@@ -29,6 +29,7 @@ export type RunEvent = {
   metrics?: import("./state").ChatMetrics;
   usage?: RunUsage;
   notice?: string;
+  step?: import("./state").AgentStep;
   count?: number;
   truncated?: boolean;
   skippedFiles?: number;
@@ -55,6 +56,8 @@ export const core = {
     return invoke<string>("start_turn", { sessionId, text, model, onEvent });
   },
   /** Continues an answer that stopped at the output limit, in a new run with a fresh budget. */
+  /** Answer an agent step that waits for Allow/Deny. */
+  resolveApproval: (approvalId: string, allow: boolean) => invoke<boolean>("resolve_approval", { approvalId, allow }),
   continueTurn: (sessionId: string, messageId: string, model: string, receive: (event: RunEvent) => void) => {
     const onEvent = new Channel<RunEvent>();
     onEvent.onmessage = receive;

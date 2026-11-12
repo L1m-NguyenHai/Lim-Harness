@@ -8,6 +8,7 @@ import type { InferenceSettings, RunEvent, RunUsage } from "./core";
 import { InferencePanel } from "./InferencePanel";
 import { ContextMeter } from "./ContextMeter";
 import { ThinkingSteps } from "./ThinkingSteps";
+import { AgentSteps } from "./AgentSteps";
 import { thinkingSteps } from "./thinking-steps";
 import { contextUsage } from "./context-usage";
 import type { VaultHit } from "./core";
@@ -36,6 +37,7 @@ import {
   Square,
   Trash2,
   Play,
+  Bot,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { moduleCatalog, newSession, readState, STORAGE_KEY } from "./state";
@@ -460,6 +462,11 @@ export default function App() {
             const base = { ...m, runId: event.runId, ...(event.message ?? {}) };
             if (event.type === "text_delta") base.text = m.text + (event.delta ?? "");
             if (event.type === "thinking_delta") base.thinking = (m.thinking ?? "") + (event.delta ?? "");
+            if (event.type === "agent_step" && event.step) {
+              const step = event.step;
+              const steps = m.steps ?? [];
+              base.steps = steps.some((s) => s.id === step.id) ? steps.map((s) => s.id === step.id ? step : s) : [...steps, step];
+            }
             if (event.type === "metrics" && event.metrics) base.metrics = event.metrics;
             if (event.sources) base.sources = event.sources;
             if (["completed", "truncated", "cancelled", "failed"].includes(event.type))
@@ -505,6 +512,17 @@ export default function App() {
       const snapshot = await core.snapshot();
       setState((c) => ({ ...c, sessions: c.sessions.map((s) => s.id === sessionId ? snapshot.sessions.find((n) => n.id === sessionId) ?? s : s) }));
       setNotice(count ? `Đã thu gọn ${count} tin cũ thành bản tóm tắt.` : "Chưa có lượt cũ nào cần thu gọn.");
+    } catch (error) { setRuntimeError(String(error)); }
+  }
+  // Agent mode is a per-session setting, saved like the other run parameters.
+  async function toggleAgent() {
+    try { await saveInference({ ...panelSettings, agentMode: !effective.agentMode }, effective.contextSize); }
+    catch (error) { setRuntimeError(String(error)); }
+  }
+  async function resolveApproval(approvalId: string, allow: boolean) {
+    try {
+      const pending = await core.resolveApproval(approvalId, allow);
+      if (!pending) setNotice("Yêu cầu này đã hết hạn hoặc lượt chạy đã dừng.");
     } catch (error) { setRuntimeError(String(error)); }
   }
   async function stop() {
@@ -723,7 +741,7 @@ export default function App() {
               {storageError}
             </div>
           )}
-          {runtimeError && <div className="storage-error" role="alert">{runtimeError}<button className="icon-button" aria-label="Đóng lỗi" onClick={() => setRuntimeError("")}><X size={15} /></button></div>}
+          {runtimeError && <div className="storage-error dismissible" role="alert"><span>{runtimeError}</span><button className="icon-button" aria-label="Đóng thông báo" onClick={() => setRuntimeError("")}><X size={15} /></button></div>}
           <div className="chat-layout"><main
             id="main"
             tabIndex={-1}
@@ -796,6 +814,9 @@ export default function App() {
                                 </details>;
                               })()
                             )}
+                            {!isUser && !!m.steps?.length && <AgentSteps steps={m.steps} onResolve={native ? resolveApproval : undefined} />}
+                            {/* App-side warning, independent of what the model writes: the turn tried the web but got no usable source. */}
+                            {!isUser && m.status !== "running" && m.steps?.some((s) => s.tool === "web_search" || s.tool === "fetch_url") && !m.steps.some((s) => (s.tool === "web_search" && s.status === "done") || (s.tool === "fetch_url" && s.status === "done" && !/\(HTTP [45]\d\d\)/.test(s.output ?? ""))) && <p className="agent-unverified" role="note">Chưa lấy được nguồn web nào trong lượt này. Câu trả lời dựa trên kiến thức có sẵn của model, có thể đã cũ hoặc sai.</p>}
                             <div className="message-bubble">
                               <p>{answer || (isRunning ? "Đang chờ model…" : "Không có nội dung trả lời.")}</p>
                             </div>
@@ -856,7 +877,7 @@ export default function App() {
                     <textarea
                       id="message-input"
                       ref={composer}
-                      placeholder={state.preferences.model ? `Nhắn cho ${state.preferences.model}...` : "Nhắn cho Lim..."}
+                      placeholder={effective.agentMode ? "Giao việc cho Lim: tra cứu web, xem tệp, chạy lệnh…" : state.preferences.model ? `Nhắn cho ${state.preferences.model}...` : "Nhắn cho Lim..."}
                       value={draft}
                       readOnly={busy}
                       maxLength={20000}
@@ -898,6 +919,17 @@ export default function App() {
                           <Cpu size={15} />
                           <span>{state.preferences.model || "Chọn model"}</span>
                           <ChevronDown size={13} />
+                        </button>
+                        <button
+                          type="button"
+                          className={`module-button agent-toggle ${effective.agentMode ? "on" : ""}`}
+                          aria-pressed={effective.agentMode}
+                          disabled={!ready || Boolean(running[session.id])}
+                          title={effective.agentMode ? "Agent đang bật: Lim có thể tra web, đọc thư mục và (khi bạn cho phép) chạy lệnh, đọc/ghi tệp" : "Bật Agent để Lim dùng công cụ: web, tệp, terminal"}
+                          onClick={() => void toggleAgent()}
+                        >
+                          <Bot size={15} />
+                          <span>Agent</span>
                         </button>
                         <button
                           type="button"
