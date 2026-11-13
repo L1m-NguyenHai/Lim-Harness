@@ -257,3 +257,33 @@ kbd, code, pre { font-family: var(--font-mono); }
 .compact-divider > summary { cursor: pointer; padding: 7px 12px; font-family: var(--font-mono); font-size: 12px; color: var(--muted); list-style: none; text-align: center; }
 .compact-divider > summary::-webkit-details-marker { display: none; }
 .compact-divider > p { margin: 0; padding: 0 14px 12px; font-size: 13px; line-height: 1.6; color: var(--text); white-space: pre-wrap; }
+
+/* Dismissible notice bar: text on the left, close button centered on the right */
+.storage-error.dismissible { display: flex; align-items: center; gap: 12px; padding: 6px 12px 6px 24px; font-size: 13px; line-height: 1.5; }
+.storage-error.dismissible > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.storage-error.dismissible > .icon-button { flex-shrink: 0; display: grid; place-items: center; width: 28px; height: 28px; padding: 0; color: var(--ochre); }
+.storage-error.dismissible > .icon-button:hover:not(:disabled) { background: var(--accent-soft); background: color-mix(in srgb, var(--ochre) 12%, transparent); }
+
+/* Agent mode */
+.agent-toggle.on { color: var(--accent); border-color: var(--accent-border); background: var(--accent-soft); }
+.agent-steps { list-style: none; margin: 0 0 10px; padding: 0; display: grid; gap: 6px; }
+.agent-step { display: flex; gap: 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--sidebar); }
+.agent-step-icon { display: grid; place-items: center; flex-shrink: 0; width: 24px; height: 24px; border-radius: 7px; background: var(--surface); border: 1px solid var(--border); color: var(--muted); }
+.agent-step.running .agent-step-icon { color: var(--accent); border-color: var(--accent-border); animation: thinking-pulse 1.4s ease-in-out infinite; }
+.agent-step.waiting { border-color: var(--ochre); }
+.agent-step.waiting .agent-step-icon { color: var(--ochre); }
+.agent-step-body { flex: 1; min-width: 0; display: grid; gap: 6px; }
+.agent-step-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.agent-step-title { font-size: 13px; color: var(--text); overflow-wrap: anywhere; }
+.agent-step-status { flex-shrink: 0; font-family: var(--font-mono); font-size: 11px; color: var(--muted); }
+.agent-step.done .agent-step-status { color: var(--success); }
+.agent-step.waiting .agent-step-status, .agent-step.denied .agent-step-status, .agent-step.error .agent-step-status { color: var(--ochre); }
+.agent-approval { display: grid; gap: 8px; }
+.message .agent-approval p { margin: 0; display: flex; align-items: center; gap: 6px; font-size: 13px; line-height: 1.5; color: var(--ochre); }
+.agent-approval pre, .agent-step-output pre { margin: 0; padding: 8px 10px; border-radius: 8px; background: var(--surface); border: 1px solid var(--border); font-family: var(--font-mono); font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow: auto; }
+.agent-approval-actions { display: flex; gap: 8px; }
+.agent-approval-actions button { display: inline-flex; align-items: center; gap: 6px; min-height: 28px; padding: 4px 12px; border-radius: 999px; font-size: 12px; }
+.agent-step-output > summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+.agent-step-output[open] > summary { margin-bottom: 6px; }
+@media (prefers-reduced-motion: reduce) { .agent-step.running .agent-step-icon { animation: none; } }
+.message .agent-unverified { margin: 0 0 8px; padding: 7px 10px; border-left: 3px solid var(--ochre); border-radius: 6px; background: var(--ochre-soft); color: var(--ochre); font-size: 13px; line-height: 1.5; }

@@ -48,6 +48,8 @@ pub struct InferenceSettings {
     pub seed: Option<i64>,
     /// Summarize older turns when the conversation nears the context limit.
     pub auto_compact: bool,
+    /// Agent mode: the model may call tools (web, files, terminal) during a turn.
+    pub agent_mode: bool,
 }
 impl Default for InferenceSettings {
     fn default() -> Self {
@@ -61,6 +63,7 @@ impl Default for InferenceSettings {
             legacy_think_predict: 0,
             seed: None,
             auto_compact: true,
+            agent_mode: false,
         }
     }
 }
@@ -148,6 +151,9 @@ pub struct Message {
     /// Failure reason of the run that produced a failed assistant message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Agent mode: tool steps taken while producing this answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steps: Option<Vec<serde_json::Value>>,
 }
 /// Every run setting of one session: its context window plus all inference parameters.
 #[derive(Clone, Serialize, Deserialize)]
@@ -228,6 +234,7 @@ impl Store {
             "ALTER TABLE messages ADD COLUMN model TEXT",
             "ALTER TABLE messages ADD COLUMN thinking TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE messages ADD COLUMN metrics TEXT",
+            "ALTER TABLE messages ADD COLUMN steps TEXT",
             "ALTER TABLE sessions ADD COLUMN config TEXT",
             "ALTER TABLE sessions ADD COLUMN summary TEXT",
             "ALTER TABLE sessions ADD COLUMN summary_until TEXT",
@@ -376,7 +383,7 @@ impl Store {
     }
     pub fn messages(&self, session: &str) -> Result<Vec<Message>, String> {
         let db = self.db()?;
-        let mut stmt=db.prepare("SELECT m.id,m.role,m.text,m.source,m.run_id,m.status,m.sources,m.model,m.thinking,m.metrics,CASE WHEN m.role='assistant' AND m.status='failed' THEN r.error END FROM messages m LEFT JOIN runs r ON r.id=m.run_id WHERE m.session_id=?1 ORDER BY m.position,m.rowid").map_err(|e|e.to_string())?;
+        let mut stmt=db.prepare("SELECT m.id,m.role,m.text,m.source,m.run_id,m.status,m.sources,m.model,m.thinking,m.metrics,CASE WHEN m.role='assistant' AND m.status='failed' THEN r.error END,m.steps FROM messages m LEFT JOIN runs r ON r.id=m.run_id WHERE m.session_id=?1 ORDER BY m.position,m.rowid").map_err(|e|e.to_string())?;
         let rows = stmt
             .query_map([session], |r| {
                 let raw: Option<String> = r.get(6)?;
@@ -395,6 +402,7 @@ impl Store {
                     thinking: thinking.filter(|t| !t.is_empty()),
                     metrics: metrics_raw.and_then(|s| serde_json::from_str(&s).ok()),
                     error: r.get(10).unwrap_or(None),
+                    steps: r.get::<_, Option<String>>(11).unwrap_or(None).and_then(|s| serde_json::from_str(&s).ok()),
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -615,6 +623,7 @@ impl Store {
             thinking: None,
             metrics: None,
             error: None,
+            steps: None,
         };
         let assistant = Message {
             id: Uuid::new_v4().to_string(),
@@ -628,6 +637,7 @@ impl Store {
             thinking: None,
             metrics: None,
             error: None,
+            steps: None,
         };
         for (offset, message) in [&user, &assistant].iter().enumerate() {
             tx.execute("INSERT INTO messages(id,session_id,run_id,role,text,source,status,created,position,model,thinking) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'')",params![message.id,session,run,message.role,message.text,message.source,message.status,timestamp,position+offset as i64,message.model]).map_err(|e|e.to_string())?;
@@ -751,9 +761,10 @@ impl Store {
             .as_ref()
             .and_then(|m| serde_json::to_string(m).ok());
         let thinking_raw = message.thinking.clone().unwrap_or_default();
+        let steps_raw = message.steps.as_ref().and_then(|s| serde_json::to_string(s).ok());
         tx.execute(
-            "UPDATE messages SET text=?2,status=?3,thinking=?4,metrics=?5,model=COALESCE(model,?6) WHERE id=?1 AND status='running'",
-            params![message.id, message.text, status, thinking_raw, metrics_raw, message.model],
+            "UPDATE messages SET text=?2,status=?3,thinking=?4,metrics=?5,model=COALESCE(model,?6),steps=COALESCE(?7,steps) WHERE id=?1 AND status='running'",
+            params![message.id, message.text, status, thinking_raw, metrics_raw, message.model, steps_raw],
         )
         .map_err(|e| e.to_string())?;
         tx.execute(
