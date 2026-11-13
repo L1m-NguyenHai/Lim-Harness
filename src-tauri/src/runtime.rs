@@ -63,6 +63,9 @@ pub(crate) struct Counts {
     thinking: u64,
     answer: u64,
     budget: u64,
+    /// Agent mode collects tool calls instead of rejecting them.
+    agent: bool,
+    tool_calls: Vec<Value>,
 }
 impl Counts {
     fn usage(&self) -> Value {
@@ -84,6 +87,8 @@ pub struct Runtime {
     active: Mutex<HashMap<String, ActiveRun>>,
     pub(crate) client: reqwest::Client,
     pub(crate) model_gate: Arc<RwLock<()>>,
+    /// Agent steps waiting for the user's Allow/Deny, keyed by approval id.
+    approvals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
     pub(crate) memory_control: Mutex<()>,
     pub(crate) memory_cancel: watch::Sender<u64>,
     pub(crate) memory_running: AtomicBool,
@@ -102,6 +107,7 @@ impl Runtime {
             active: Mutex::new(HashMap::new()),
             client,
             model_gate: Arc::new(RwLock::new(())),
+            approvals: Mutex::new(HashMap::new()),
             memory_control: Mutex::new(()),
             memory_cancel: watch::channel(0).0,
             memory_running: AtomicBool::new(false),
@@ -215,6 +221,20 @@ pub async fn search_memory(
     tauri::async_runtime::spawn_blocking(move || vault::search_vault(&path, &query, 10))
         .await
         .map_err(|e| e.to_string())?
+}
+/// What Agent mode needs besides the chat model, for the setup buttons in Settings: the
+/// decision model (installed in Ollama or not) and the local SearXNG.
+#[tauri::command]
+pub async fn agent_setup_status(state: State<'_, Arc<Runtime>>) -> Result<Value, String> {
+    let decision = state.store.setting("decision_model").ok().filter(|m| !m.trim().is_empty()).unwrap_or_else(|| crate::agent::DECISION_MODEL.to_string());
+    let models = list_models(state).await;
+    let installed = models.as_ref().ok().map(|names| names.iter().any(|n| n == &decision || n.strip_suffix(":latest") == Some(decision.as_str())));
+    Ok(json!({
+        "decisionModel": decision,
+        "decisionInstalled": installed,
+        "ollama": models.is_ok(),
+        "searxng": crate::searxng::status(),
+    }))
 }
 #[tauri::command]
 pub async fn list_models(state: State<'_, Arc<Runtime>>) -> Result<Vec<String>, String> {
@@ -561,13 +581,17 @@ async fn generate(
         compact_with_events(runtime, session, model, context_size, settings, info.as_ref(), false, channel, run, session, sequence).await;
     }
     let (summary, until) = runtime.store.session_summary(session)?;
-    let system = system_with_summary(&settings.system_prompt, summary.as_deref());
+    let mut system = system_with_summary(&settings.system_prompt, summary.as_deref());
+    if settings.agent_mode {
+        system = format!("{system}\n\n{}", crate::agent::instructions()).trim().to_string();
+    }
     let mut history = Vec::new();
     if !system.is_empty() {
         history.push(json!({"role":"system","content":system}));
     }
     let mut history_budget = input_budget(context_size, settings)
-        .saturating_sub(summary.as_deref().map_or(0, |s| estimate_tokens(&summary_block(s))));
+        .saturating_sub(summary.as_deref().map_or(0, |s| estimate_tokens(&summary_block(s))))
+        .saturating_sub(if settings.agent_mode { estimate_tokens(&crate::agent::instructions()) + 600 } else { 0 });
     let mut retrieved_context = None;
     // Notes get at most 4.500 bytes and never the room the new message needs.
     let memory_budget = history_budget.saturating_sub(estimate_tokens(text) + 16).saturating_mul(3).min(4_500);
@@ -668,11 +692,19 @@ async fn generate(
     // One output limit shared by thinking and answer; Ollama counts it exactly.
     options["num_predict"] = json!(settings.num_predict);
     let request = json!({"model":model,"messages":history,"stream":true,"options":options});
-    let mut counts = Counts {
-        thinking: 0,
-        answer: 0,
-        budget: settings.num_predict as u64,
-    };
+    let tools_capable = info.as_ref().is_some_and(|i| i["capabilities"].as_array().is_some_and(|c| c.iter().any(|v| v == "tools")));
+    if settings.agent_mode {
+        if !tools_capable {
+            return Err(format!("Model {model} không hỗ trợ gọi công cụ nên không chạy được chế độ Agent. Chọn model có khả năng tools (ví dụ qwen3, qwen3.5, llama3.1)."));
+        }
+        return agent_loop(runtime, session, run, model, history, options, crate::agent::tool_specs(), context_size, settings, info.as_ref(), assistant, channel, sequence, content, thinking, metrics).await;
+    }
+    // Normal chat on a tools-capable model goes through the same loop with only the local
+    // clock tool: that alone keeps Qwen-style reasoning short on simple prompts.
+    if tools_capable {
+        return agent_loop(runtime, session, run, model, history, options, crate::agent::chat_tool_specs(), context_size, settings, info.as_ref(), assistant, channel, sequence, content, thinking, metrics).await;
+    }
+    let mut counts = Counts { thinking: 0, answer: 0, budget: settings.num_predict as u64, agent: false, tool_calls: Vec::new() };
     let _ = emit(channel, run, session, sequence, counts.usage());
     let step = stream_chat(
         runtime,
@@ -692,6 +724,455 @@ async fn generate(
     .await?;
     let _ = emit(channel, run, session, sequence, counts.usage());
     outcome(step, content)
+}
+/// Answer from the user's Allow/Deny on an agent step.
+#[tauri::command]
+pub fn resolve_approval(state: State<'_, Arc<Runtime>>, approval_id: String, allow: bool) -> Result<bool, String> {
+    let sender = state.approvals.lock().map_err(|_| "Runtime không khả dụng")?.remove(&approval_id);
+    Ok(sender.is_some_and(|sender| sender.send(allow).is_ok()))
+}
+/// Agent mode: Ollama tool calling in a loop. Each round streams the model; tool calls are
+/// executed (risky ones after the user's approval) and their results appended as `tool`
+/// messages, until the model answers without tools or MAX_STEPS is reached.
+#[allow(clippy::too_many_arguments)]
+/// Debug smoke test of whole agent turns in the running app (real browser, real model):
+/// `LIM_AGENT_SMOKE=<output file>`, `LIM_AGENT_SMOKE_PROMPTS="first|second|…"` (one session, so later
+/// prompts see the earlier turns), `LIM_AGENT_MODEL` (default qwen3.5:2b), `LIM_DECISION_MODEL`
+/// (stored as the decision_model setting of the test data). Approvals are denied.
+#[cfg(debug_assertions)]
+pub fn agent_smoke(runtime: Arc<Runtime>, output: std::path::PathBuf) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let prompts = std::env::var("LIM_AGENT_SMOKE_PROMPTS").unwrap_or_default();
+        let model = std::env::var("LIM_AGENT_MODEL").unwrap_or_else(|_| "qwen3.5:2b".into());
+        let settings = InferenceSettings { agent_mode: true, num_predict: 2048, ..Default::default() };
+        let mut log = format!("model {model}\n");
+        if let Ok(decider) = std::env::var("LIM_DECISION_MODEL") {
+            let _ = runtime.store.set_setting("decision_model", &decider);
+            log.push_str(&format!("decision model {decider}
+"));
+        }
+        let Ok(session) = runtime.store.create_session() else { return };
+        for prompt in prompts.split('|').map(str::trim).filter(|p| !p.is_empty()) {
+            let run = Uuid::new_v4().to_string();
+            let Ok((_, mut assistant)) = runtime.store.begin_with_memory_target(&session.id, &run, &model, prompt, None) else { break };
+            let channel: Channel<Value> = Channel::new(|_| Ok(()));
+            let (mut sequence, mut content, mut thinking, mut metrics) = (0, String::new(), String::new(), None);
+            let deny = async {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let pending: Vec<String> = runtime.approvals.lock().map(|a| a.keys().cloned().collect()).unwrap_or_default();
+                    for id in pending {
+                        if let Some(sender) = runtime.approvals.lock().ok().and_then(|mut a| a.remove(&id)) {
+                            let _ = sender.send(false);
+                        }
+                    }
+                }
+            };
+            let started = std::time::Instant::now();
+            let result = tokio::select! {
+                result = generate(&runtime, &session.id, &run, &model, prompt, 8192, &settings, &mut assistant, &channel, &mut sequence, &mut content, &mut thinking, &mut metrics) => result,
+                _ = deny => unreachable!(),
+            };
+            assistant.text = content.clone();
+            let status = if result.is_ok() { "completed" } else { "failed" };
+            let _ = runtime.store.finish(&session.id, &assistant, status, result.as_ref().err().map(String::as_str));
+            log.push_str(&format!("\n===== {prompt} ({} s, {status})\n", started.elapsed().as_secs()));
+            for step in assistant.steps.iter().flatten() {
+                let text = step["output"].as_str().unwrap_or_default();
+                let output = if step["tool"] == "recent_context" { text.lines().filter(|l| l.contains("Hiểu yêu cầu")).collect::<Vec<_>>().join(" ") } else { text.lines().take(2).collect::<Vec<_>>().join(" | ") };
+                log.push_str(&format!("  - [{}] {} -> {}\n", step["status"].as_str().unwrap_or_default(), step["title"].as_str().unwrap_or_default(), output.chars().take(200).collect::<String>()));
+            }
+            log.push_str(&format!("  answer: {}\n", content.replace('\n', " ").chars().take(300).collect::<String>()));
+            let _ = std::fs::write(&output, &log);
+        }
+        log.push_str("\n===== done\n");
+        let _ = std::fs::write(&output, &log);
+    });
+}
+
+/// The app runs a tool itself (shown as a step) when the model could not, e.g. opening the page
+/// an open request asked for.
+#[allow(clippy::too_many_arguments)]
+async fn app_runs(client: &reqwest::Client, cap: usize, tool: &str, args: Value, channel: &Channel<Value>, run: &str, session: &str, sequence: &mut u64) -> Value {
+    let mut step = json!({"id":Uuid::new_v4().to_string(),"tool":tool,"title":crate::agent::title(tool, &args),"args":args,"status":"running","output":""});
+    let _ = emit(channel, run, session, sequence, json!({"type":"agent_step","step":step}));
+    let (status, result) = match crate::agent::run(client, tool, &step["args"].clone(), cap).await {
+        Ok(text) => ("done", text),
+        Err(error) => ("error", format!("Lỗi: {error}")),
+    };
+    step["status"] = json!(status);
+    step["output"] = json!(crate::agent::truncate(&result, 4_000));
+    let _ = emit(channel, run, session, sequence, json!({"type":"agent_step","step":step}));
+    step
+}
+
+/// The last `count` user/assistant pairs before the current message, as plain text.
+fn recent_turns(messages: &[Value], count: usize) -> Vec<(String, String)> {
+    let last_user = messages.iter().rposition(|m| m["role"] == "user").unwrap_or(messages.len());
+    let mut pairs = Vec::new();
+    let mut pending: Option<String> = None;
+    for m in &messages[..last_user] {
+        let text = m["content"].as_str().unwrap_or_default();
+        match m["role"].as_str() {
+            Some("user") => pending = Some(text.rsplit("Current user message:\n").next().unwrap_or(text).trim().to_string()),
+            Some("assistant") if !text.trim().is_empty() => {
+                if let Some(user) = pending.take() {
+                    pairs.push((user, text.trim().to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+    let skip = pairs.len().saturating_sub(count);
+    pairs.into_iter().skip(skip).collect()
+}
+
+/// The decision for this turn (see agent.rs, "Decision"): the decision model, on the CPU so it
+/// stays loaded beside the chat model; if it is not installed or fails, the chat model itself
+/// with the same prompt. None when neither answers.
+async fn decide(runtime: &Runtime, model: &str, thinks: bool, context_size: usize, question: &str, history: &[(String, String)]) -> Option<crate::agent::Intent> {
+    let shown = history.iter().map(|(u, a)| format!("{u}\n{a}")).collect::<Vec<_>>().join("\n");
+    let chosen = runtime.store.setting("decision_model").ok().filter(|m| !m.trim().is_empty()).unwrap_or_else(|| crate::agent::DECISION_MODEL.to_string());
+    let decider_thinks = model_show(runtime, &chosen).await.is_some_and(|i| i["capabilities"].as_array().is_some_and(|c| c.iter().any(|v| v == "thinking")));
+    let mut candidates = vec![(chosen, decider_thinks, json!({"temperature": 0, "num_ctx": 2048, "num_predict": 300, "num_gpu": 0}))];
+    // Same context size as the turn: a different num_ctx would make Ollama reload the chat model.
+    candidates.push((model.to_string(), thinks, json!({"temperature": 0, "num_ctx": context_size, "num_predict": 300})));
+    for (decider, decider_thinks, options) in candidates {
+        // A follow-up is first rewritten to stand alone; the decision never sees the earlier turns.
+        let rewritten = if history.is_empty() {
+            None
+        } else {
+            let reply = structured(runtime, &decider, decider_thinks, options.clone(), crate::agent::rewrite_system(), crate::agent::rewrite_schema(), &crate::agent::decision_user(question, history)).await;
+            reply.and_then(|r| r["message"].as_str().and_then(|m| crate::agent::standalone(question, m, &shown)))
+        };
+        let asked = crate::agent::decision_user(rewritten.as_deref().unwrap_or(question), &[]);
+        let reply = structured(runtime, &decider, decider_thinks, options, crate::agent::decision_system(), crate::agent::decision_schema(), &asked).await;
+        if let Some(mut intent) = reply.and_then(|m| crate::agent::parse_decision(&m.to_string())) {
+            intent.refers_to_previous = rewritten.is_some();
+            intent.earlier = shown;
+            return Some(intent);
+        }
+    }
+    None
+}
+
+/// One decision call whose answer must match `schema` (Ollama `format`); the parsed JSON, or None.
+async fn structured(runtime: &Runtime, model: &str, thinks: bool, options: Value, system: &str, schema: Value, user: &str) -> Option<Value> {
+    let mut body = json!({
+        "model": model, "stream": false, "format": schema,
+        "messages": [{"role":"system","content":system},{"role":"user","content":user}],
+        "options": options
+    });
+    if thinks {
+        body["think"] = json!(false);
+    }
+    let reply: Value = runtime.client.post(format!("{OLLAMA}/api/chat")).timeout(Duration::from_secs(90)).json(&body).send().await.ok()?.error_for_status().ok()?.json().await.ok()?;
+    serde_json::from_str(reply["message"]["content"].as_str()?).ok()
+}
+
+async fn agent_loop(
+    runtime: &Runtime,
+    session: &str,
+    run: &str,
+    model: &str,
+    mut messages: Vec<Value>,
+    options: Value,
+    tools: Value,
+    context_size: usize,
+    settings: &InferenceSettings,
+    info: Option<&Value>,
+    assistant: &mut Message,
+    channel: &Channel<Value>,
+    sequence: &mut u64,
+    content: &mut String,
+    thinking: &mut String,
+    metrics: &mut Option<crate::storage::ChatMetrics>,
+) -> Result<bool, String> {
+    let client = crate::agent::client()?;
+    let budget_bytes = input_budget(context_size, settings) * 3;
+    // Each tool result is capped; old results shrink when they crowd the window.
+    let cap = (budget_bytes / 3).clamp(1_500, 6_000);
+    let mut steps: Vec<Value> = assistant.steps.clone().unwrap_or_default();
+    let mut counts = Counts { thinking: 0, answer: 0, budget: settings.num_predict as u64, agent: true, tool_calls: Vec::new() };
+    let mut total_output = 0u64;
+    // After a denial the next round gets no tools, so the model answers instead of retrying.
+    let mut force_answer = false;
+    let thinks = info.is_some_and(|i| i["capabilities"].as_array().is_some_and(|c| c.iter().any(|v| v == "thinking")));
+    let _ = emit(channel, run, session, sequence, counts.usage());
+    // Memory v1 prepends recalled notes to the last user turn; only the question counts.
+    let question = {
+        let last_user = messages.iter().rev().find(|m| m["role"] == "user").and_then(|m| m["content"].as_str()).unwrap_or_default();
+        last_user.rsplit("Current user message:\n").next().unwrap_or(last_user).trim().to_string()
+    };
+    // Every decision about the request comes from the decision model (see agent.rs, "Decision").
+    let history = recent_turns(&messages, 2);
+    let intent = if settings.agent_mode && steps.is_empty() {
+        decide(runtime, model, thinks, context_size, &question, &history).await
+    } else {
+        None
+    }
+    .unwrap_or_else(crate::agent::Intent::none);
+    // A new request is handled on its own, so the last song/page does not leak into it.
+    if settings.agent_mode && steps.is_empty() {
+        messages = crate::agent::focus_messages(messages, intent.refers_to_previous);
+    }
+    // Agent mode starts every new turn by checking the clock, so questions about "current"
+    // facts are searched and dated against today rather than the model's training cutoff.
+    // A continued answer already has it.
+    if settings.agent_mode && steps.is_empty() {
+        let args = json!({});
+        let now = crate::agent::run(&client, "current_time", &args, cap).await?;
+        let step = json!({"id":Uuid::new_v4().to_string(),"tool":"current_time","title":crate::agent::title("current_time", &args),"args":args,"status":"done","output":now});
+        let _ = emit(channel, run, session, sequence, json!({"type":"agent_step","step":step}));
+        steps.push(step);
+        messages.push(json!({"role":"assistant","content":"","tool_calls":[{"function":{"name":"current_time","arguments":{}}}]}));
+        messages.push(json!({"role":"tool","tool_name":"current_time","content":now}));
+        // Follow-ups like "mở bài khác" / "mở đi" need what earlier turns found: history only
+        // keeps answer text, so the open tabs and the real links tools returned are added here.
+        let mut recent = crate::agent::recent_context(&runtime.store.messages(session)?, &crate::browser::tab_lines(), &question, intent.refers_to_previous);
+        recent.push('\n');
+        recent.push_str(&intent.note(&question));
+        if !recent.is_empty() {
+            let args = json!({});
+            let step = json!({"id":Uuid::new_v4().to_string(),"tool":"recent_context","title":crate::agent::title("recent_context", &args),"args":args,"status":"done","output":recent});
+            let _ = emit(channel, run, session, sequence, json!({"type":"agent_step","step":step}));
+            steps.push(step);
+            messages.push(json!({"role":"assistant","content":"","tool_calls":[{"function":{"name":"recent_context","arguments":{}}}]}));
+            messages.push(json!({"role":"tool","tool_name":"recent_context","content":recent}));
+        }
+        // Questions about the present are searched right away (dated); a weak model (no
+        // reasoning) gets every look-up searched for it.
+        let pre_search = intent.pre_search(&question, thinks);
+        if let Some(query) = pre_search {
+            let args = json!({"query": query});
+            let mut step = json!({"id":Uuid::new_v4().to_string(),"tool":"web_search","title":crate::agent::title("web_search", &args),"args":args,"status":"running","output":""});
+            let _ = emit(channel, run, session, sequence, json!({"type":"agent_step","step":step}));
+            let (status, result) = match crate::agent::run(&client, "web_search", &args, cap).await {
+                Ok(text) => ("done", text),
+                Err(error) => ("error", format!("Lỗi: {error}")),
+            };
+            step["status"] = json!(status);
+            step["output"] = json!(crate::agent::truncate(&result, 4_000));
+            let _ = emit(channel, run, session, sequence, json!({"type":"agent_step","step":step}));
+            steps.push(step);
+            messages.push(json!({"role":"assistant","content":"","tool_calls":[{"function":{"name":"web_search","arguments":args}}]}));
+            messages.push(json!({"role":"tool","tool_name":"web_search","content":result}));
+        }
+    }
+    // Everything the user wrote and every tool result of this turn: URLs the model opens must
+    // come from here (kept apart from `messages`, whose old results get shrunk).
+    let mut seen: String = messages.iter().filter(|m| m["role"] == "user" || m["role"] == "tool").filter_map(|m| m["content"].as_str()).collect::<Vec<_>>().join("\n");
+    let mut nudged = false;
+    // Made-up URLs refused this turn; after two, the app opens the best real link itself.
+    let mut refused = 0;
+    let site = intent.site_label(&question);
+    // A question is answered from web_search (SearXNG) and fetch_url; the browser is for opening.
+    let tools = crate::agent::tools_for(&intent, &tools);
+    for round in 0..=crate::agent::MAX_STEPS {
+        let last_round = round == crate::agent::MAX_STEPS || force_answer;
+        let mut request = json!({"model":model,"messages":messages,"stream":true,"options":options});
+        // The final round has no tools so the model must answer with what it has.
+        if !last_round {
+            request["tools"] = tools.clone();
+        }
+        let before = content.len();
+        let step = stream_chat(runtime, &request, assistant, channel, run, session, sequence, content, thinking, metrics, model, context_size, &mut counts).await?;
+        total_output += metrics.as_ref().and_then(|m| m.output_tokens).unwrap_or(0);
+        let mut calls = std::mem::take(&mut counts.tool_calls);
+        // A weak model may write the call as JSON text: run it as a call and hide that text.
+        if calls.is_empty() && !last_round {
+            let parsed = crate::agent::calls_from_text(&content[before..]);
+            if !parsed.is_empty() {
+                calls = parsed;
+                content.truncate(before);
+                let _ = emit(channel, run, session, sequence, json!({"type":"text_reset","text":content.clone()}));
+            }
+        }
+        let mut step = step;
+        // The model stopped without acting: it wrote nothing ("đổi sang bài khác" → only
+        // thoughts), or answered an open request with a bare link. Drop the draft and remind it
+        // once, with tools still available. Measured: qwen3.5:2b often thinks "I'll search…"
+        // and then ends the turn without the call.
+        let opened = steps.iter().any(|s| matches!(s["tool"].as_str(), Some("browser_open" | "browser_search")) && s["status"] == "done");
+        // Nothing, or a dangling start like "Câu trả lời:" (llama3.2:1b), counts as silent.
+        let silent = { let draft = content[before..].trim(); draft.is_empty() || (draft.ends_with(':') && draft.chars().count() < 40) };
+        let open_request = intent.opens() && !opened;
+        if calls.is_empty() && !last_round && !nudged && matches!(step, Step::Done) && settings.agent_mode && (silent || open_request) {
+            nudged = true;
+            let draft = content[before..].to_string();
+            content.truncate(before);
+            let _ = emit(channel, run, session, sequence, json!({"type":"text_reset","text":content.clone()}));
+            if !silent {
+                messages.push(json!({"role":"assistant","content":draft}));
+            }
+            let reminder = if open_request { crate::agent::OPEN_REMINDER } else { crate::agent::ACT_REMINDER };
+            messages.push(json!({"role":"user","content":reminder}));
+            continue;
+        }
+        // Small models sometimes write the final answer inside an unclosed reasoning block, so
+        // Ollama returns it as thinking with empty content. Ask once more for the answer only.
+        if (calls.is_empty() || last_round) && matches!(step, Step::Done) && content[before..].trim().is_empty() {
+            let mut retry = json!({"model":model,"messages":messages,"stream":true,"options":options});
+            if thinks {
+                retry["think"] = json!(false);
+            }
+            step = stream_chat(runtime, &retry, assistant, channel, run, session, sequence, content, thinking, metrics, model, context_size, &mut counts).await?;
+            total_output += metrics.as_ref().and_then(|m| m.output_tokens).unwrap_or(0);
+            counts.tool_calls.clear();
+        }
+        if calls.is_empty() || last_round || matches!(step, Step::Length) {
+            // Asked to open something and the turn ends without that page open: the app searches
+            // (when nothing was) and opens the best result itself, for any model. llama3.2:1b
+            // opened the song in 1 of 3 tries on its own; qwen3.5:2b once said "Đã mở bài hát
+            // Hello" with only a Google results page open.
+            if settings.agent_mode && intent.opens() && crate::agent::opened_page(&steps, &site).is_none() {
+                if crate::agent::first_result_url(&steps, &site).is_none() {
+                    let args = json!({"query": intent.query(&question)});
+                    steps.push(app_runs(&client, cap, "web_search", args, channel, run, session, sequence).await);
+                }
+                if let Some(url) = crate::agent::first_result_url(&steps, &site) {
+                    let step_entry = app_runs(&client, cap, "browser_open", json!({"url": url}), channel, run, session, sequence).await;
+                    let done = step_entry["status"] == "done";
+                    steps.push(step_entry);
+                    if done {
+                        // What the model wrote did not open the page; say what was opened instead.
+                        content.clear();
+                        let _ = emit(channel, run, session, sequence, json!({"type":"text_reset","text":""}));
+                    }
+                }
+            }
+            // An answer that is only a broken call written as text is no answer.
+            if crate::agent::looks_like_call_text(&content[before..]) {
+                content.truncate(before);
+                let _ = emit(channel, run, session, sequence, json!({"type":"text_reset","text":content.clone()}));
+            }
+            // A weak model's own words after opening a page were often wrong ("Tôi xin lỗi vì không
+            // thể thực hiện" with the song playing) or a pasted page read-out: for an open request,
+            // or any pasted read-out, state what is open instead.
+            let page_open = steps.iter().any(|s| matches!(s["tool"].as_str(), Some("browser_open" | "browser_search" | "browser_click" | "browser_back")) && s["status"] == "done");
+            if settings.agent_mode && !thinks && page_open && (intent.opens() || crate::agent::echoes_tool_output(content)) {
+                content.clear();
+                let _ = emit(channel, run, session, sequence, json!({"type":"text_reset","text":""}));
+            }
+            // The work is done (e.g. the song is open) but the small model wrote nothing, even on
+            // the retry: say what was done instead of failing the whole turn.
+            if matches!(step, Step::Done) && content.trim().is_empty() && !steps.is_empty() {
+                let note = crate::agent::fallback_answer(&steps);
+                content.push_str(&note);
+                let _ = emit(channel, run, session, sequence, json!({"type":"text_delta","delta":note}));
+            }
+            // Links no tool returned are flagged, so a made-up address does not look verified.
+            let unverified = crate::agent::unverified_links(&content[before..], &seen);
+            if !unverified.is_empty() {
+                let note = format!("\n\n> ⚠️ Link chưa kiểm chứng (không có trong kết quả tra cứu, có thể sai): {}", unverified.join(", "));
+                content.push_str(&note);
+                let _ = emit(channel, run, session, sequence, json!({"type":"text_delta","delta":note}));
+            }
+            if let Some(m) = metrics.as_mut() {
+                m.output_tokens = Some(total_output);
+            }
+            assistant.steps = (!steps.is_empty()).then(|| steps.clone());
+            let _ = emit(channel, run, session, sequence, counts.usage());
+            return outcome(step, content);
+        }
+        messages.push(json!({"role":"assistant","content":content[before..].to_string(),"tool_calls":calls}));
+        for call in calls {
+            let tool = call["function"]["name"].as_str().unwrap_or_default().to_string();
+            // Weak models send the parameter schema instead of values; fix the call first.
+            let (tool, args, _repaired) = crate::agent::repair_call(&tool, crate::agent::arguments(&call), &intent.query(&question));
+            let id = Uuid::new_v4().to_string();
+            let approval = crate::agent::needs_approval(&tool);
+            let mut entry = json!({"id":id,"tool":tool,"title":crate::agent::title(&tool, &args),"args":args,"status":if approval { "waiting" } else { "running" },"output":""});
+            steps.push(entry.clone());
+            let index = steps.len() - 1;
+            // Once the user denied something this round, further risky calls are denied too.
+            let allowed = if approval && force_answer {
+                false
+            } else if approval {
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                runtime.approvals.lock().map_err(|_| "Runtime không khả dụng")?.insert(id.clone(), sender);
+                entry["approvalId"] = json!(id);
+                steps[index] = entry.clone();
+                let _ = emit(channel, run, session, sequence, json!({"type":"agent_step","step":entry}));
+                let answer = tokio::time::timeout(Duration::from_secs(600), receiver).await;
+                if let Ok(mut pending) = runtime.approvals.lock() {
+                    pending.remove(&id);
+                }
+                matches!(answer, Ok(Ok(true)))
+            } else {
+                let _ = emit(channel, run, session, sequence, json!({"type":"agent_step","step":entry}));
+                true
+            };
+            let (status, result) = if !allowed {
+                force_answer = true;
+                ("denied", "Người dùng đã từ chối thao tác này. Không thử lại; hãy trả lời với thông tin hiện có hoặc hỏi người dùng.".to_string())
+            } else {
+                entry["status"] = json!("running");
+                let _ = emit(channel, run, session, sequence, json!({"type":"agent_step","step":entry}));
+                let ran = match crate::agent::ungrounded(&tool, &args, &seen) {
+                    Some(refusal) => {
+                        refused += 1;
+                        Err(refusal)
+                    }
+                    None => crate::agent::run(&client, &tool, &args, cap).await,
+                };
+                match ran {
+                    Ok(text) => ("done", text),
+                    Err(error) => ("error", format!("Lỗi: {error}")),
+                }
+            };
+            entry["status"] = json!(status);
+            entry["output"] = json!(crate::agent::truncate(&result, 4_000));
+            entry.as_object_mut().map(|o| o.remove("approvalId"));
+            steps[index] = entry.clone();
+            let _ = emit(channel, run, session, sequence, json!({"type":"agent_step","step":entry}));
+            // Only real results count: an error (e.g. the refusal of a made-up URL) quotes that
+            // URL, and must not make it "seen" for the model's next try.
+            if status == "done" {
+                seen.push('\n');
+                seen.push_str(&result);
+            }
+            messages.push(json!({"role":"tool","tool_name":tool,"content":result}));
+        }
+        // An open request is done once the page is open: qwen3.5:2b kept opening more tabs and wrote
+        // an essay after the song was playing. One that keeps inventing URLs (5 refused in a row
+        // for vnexpress) gets the best real link opened by the app, for any model.
+        if settings.agent_mode && intent.opens() {
+            if crate::agent::opened_page(&steps, &site).is_none() && refused >= 2 {
+                if let Some(url) = crate::agent::first_result_url(&steps, &site) {
+                    steps.push(app_runs(&client, cap, "browser_open", json!({"url": url}), channel, run, session, sequence).await);
+                }
+            }
+            if let Some((title, url)) = crate::agent::opened_page(&steps, &site) {
+                content.clear();
+                let _ = emit(channel, run, session, sequence, json!({"type":"text_reset","text":""}));
+                let note = format!("Đã mở **{}** trong trình duyệt bên cạnh: {url}", if title.is_empty() { &url } else { &title });
+                content.push_str(&note);
+                let _ = emit(channel, run, session, sequence, json!({"type":"text_delta","delta":note}));
+                if let Some(m) = metrics.as_mut() {
+                    m.output_tokens = Some(total_output);
+                }
+                assistant.steps = Some(steps.clone());
+                let _ = emit(channel, run, session, sequence, counts.usage());
+                return Ok(false);
+            }
+        }
+        // Keep tool results within ~60% of the input budget: shrink the oldest first.
+        let mut tool_bytes: usize = messages.iter().filter(|m| m["role"] == "tool").map(|m| m["content"].as_str().map_or(0, str::len)).sum();
+        for message in messages.iter_mut().filter(|m| m["role"] == "tool") {
+            if tool_bytes * 10 <= budget_bytes * 6 {
+                break;
+            }
+            let size = message["content"].as_str().map_or(0, str::len);
+            message["content"] = json!("[Kết quả cũ đã được rút gọn để tiết kiệm context]");
+            tool_bytes = tool_bytes.saturating_sub(size);
+        }
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push_str("\n\n");
+        }
+    }
+    unreachable!("the last round always returns")
 }
 /// Ok(true): stopped at the output limit (the answer can be continued); Ok(false): finished.
 fn outcome(step: Step, content: &str) -> Result<bool, String> {
@@ -847,6 +1328,8 @@ async fn continue_generate(
             .unwrap_or(0),
         answer: previous.as_ref().and_then(|m| m.answer_tokens).unwrap_or(0),
         budget: granted_before + num_predict as u64,
+        agent: false,
+        tool_calls: Vec::new(),
     };
     let _ = emit(channel, run, session, sequence, counts.usage());
     let step = stream_from(
@@ -1245,13 +1728,11 @@ fn consume(
             error.chars().take(300).collect::<String>()
         ));
     }
-    if frame["message"]["tool_calls"]
-        .as_array()
-        .is_some_and(|a| !a.is_empty())
-    {
-        return Err(
-            "Model yêu cầu tool call; executor chưa được bật trong lõi hội thoại hiện tại.".into(),
-        );
+    if let Some(calls) = frame["message"]["tool_calls"].as_array().filter(|a| !a.is_empty()) {
+        if !counts.agent {
+            return Err("Model yêu cầu dùng công cụ; bật chế độ Agent để cho phép.".into());
+        }
+        counts.tool_calls.extend(calls.iter().cloned());
     }
     // Reasoning streams: Ollama thinking models expose `message.thinking`
     // (some builds use `message.reasoning` or top-level `thinking`).
@@ -1595,6 +2076,7 @@ mod history_tests {
             thinking: None,
             metrics: None,
             error: None,
+            steps: None,
         }
     }
     #[test]
@@ -1692,5 +2174,228 @@ mod compaction_tests {
         assert!(kept.len() >= 2 && kept[0].role == "user", "newest turns stay verbatim, starting at a question");
         drop(runtime);
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+#[cfg(test)]
+mod agent_live_tests {
+    use super::*;
+    /// Runs one agent turn; `approve` auto-answers approval requests like the UI buttons would.
+    fn agent_turn(prompt: &str, approve: bool) -> (Result<bool, String>, String, Vec<Value>) {
+        let dir = std::env::temp_dir().join(format!("lim-agent-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runtime = Runtime::new(crate::storage::Store::open(&dir.join("t.sqlite3")).unwrap()).unwrap();
+        let session = runtime.store.create_session().unwrap().id;
+        let run = Uuid::new_v4().to_string();
+        // LIM_AGENT_MODEL picks another installed model (e.g. llama3.2:1b) for the same checks.
+        let model_name = std::env::var("LIM_AGENT_MODEL").unwrap_or_else(|_| "qwen3.5:2b".to_string());
+        let model = model_name.as_str();
+        let (_, mut assistant) = runtime.store.begin(&session, &run, model, prompt).unwrap();
+        let channel: Channel<Value> = Channel::new(|_| Ok(()));
+        let settings = InferenceSettings { agent_mode: true, num_predict: 1536, ..Default::default() };
+        let (mut sequence, mut content, mut thinking, mut metrics) = (0, String::new(), String::new(), None);
+        let result = tauri::async_runtime::block_on(async {
+            let answer = async {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let pending: Vec<String> = runtime.approvals.lock().unwrap().keys().cloned().collect();
+                    for id in pending {
+                        if let Some(sender) = runtime.approvals.lock().unwrap().remove(&id) {
+                            println!("  approval requested -> {}", if approve { "allow" } else { "deny" });
+                            let _ = sender.send(approve);
+                        }
+                    }
+                }
+            };
+            tokio::select! {
+                result = generate(&runtime, &session, &run, model, prompt, 8192, &settings, &mut assistant, &channel, &mut sequence, &mut content, &mut thinking, &mut metrics) => result,
+                _ = answer => unreachable!(),
+            }
+        });
+        let steps = assistant.steps.clone().unwrap_or_default();
+        println!("  thinking {} chars, tail: {:?}", thinking.len(), thinking.chars().rev().take(300).collect::<Vec<_>>().into_iter().rev().collect::<String>());
+        println!("  metrics {:?}", metrics.as_ref().map(|m: &crate::storage::ChatMetrics| (m.output_tokens, m.thinking_tokens, m.answer_tokens)));
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(&dir);
+        (result, content, steps)
+    }
+    #[test]
+    #[ignore = "Requires local Ollama; set LIM_AGENT_MODEL to try another model"]
+    fn agent_opens_song() {
+        let (result, answer, steps) = agent_turn("hãy mở bài gội đầu của thắng ngọt trên youtube", false);
+        show(&steps);
+        println!("result {result:?}
+answer: {answer}");
+    }
+    /// Replays requests from the user's session (2026-11-13) and prints what would be opened.
+    #[test]
+    #[ignore = "Requires local Ollama; set LIM_AGENT_MODEL"]
+    fn replay_session_requests() {
+        for prompt in ["mở bài gội đầu của thắng ngọt", "truy cập trang chủ của bayern muchen", "đổi sang bải 2002 của anna", "mở bài period của iri trên youtube", "truy cập trang chủ MU"] {
+            let (result, answer, steps) = agent_turn(prompt, false);
+            let opens: Vec<String> = steps.iter().filter(|s| s["tool"] == "browser_open").map(|s| s["args"]["url"].as_str().unwrap_or("(index)").to_string()).collect();
+            let search = steps.iter().find(|s| s["tool"] == "web_search").map(|s| s["args"]["query"].clone());
+            println!("{prompt}
+   search {search:?}
+   open {opens:?}
+   answer {:?} {result:?}", answer.chars().take(120).collect::<String>());
+        }
+    }
+    #[test]
+    fn recent_turns_for_the_decision() {
+        let messages = vec![
+            json!({"role":"system","content":"s"}),
+            json!({"role":"user","content":"ai là tổng thống mỹ"}),
+            json!({"role":"assistant","content":"Donald Trump."}),
+            json!({"role":"user","content":"notes\n\nCurrent user message:\nông ấy bao nhiêu tuổi"}),
+        ];
+        assert_eq!(recent_turns(&messages, 2), vec![("ai là tổng thống mỹ".to_string(), "Donald Trump.".to_string())]);
+    }
+
+    /// Live: the decision through the app's own code (`decide`), on requests for many sites and
+    /// on follow-ups. LIM_DECISION_MODEL picks the decision model (default granite4:3b);
+    /// LIM_AGENT_MODEL is the chat model used when the decision model is missing.
+    #[test]
+    #[ignore = "Requires local Ollama with the decision model"]
+    fn decision_live() {
+        let model_name = std::env::var("LIM_AGENT_MODEL").unwrap_or_else(|_| "qwen3.5:2b".to_string());
+        let dir = std::env::temp_dir().join(format!("lim-decision-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runtime = Runtime::new(crate::storage::Store::open(&dir.join("t.sqlite3")).unwrap()).unwrap();
+        if let Ok(decider) = std::env::var("LIM_DECISION_MODEL") {
+            runtime.store.set_setting("decision_model", &decider).unwrap();
+        }
+        let thinks = model_name.starts_with("qwen");
+        let cases = [
+            ("vào shopee tìm tai nghe bluetooth", "open_page", "shopee"),
+            ("đọc tin mới nhất trên vnexpress", "open_page", "vnexpress"),
+            ("show me the github page of ollama", "open_page", "github"),
+            ("mở bài Hello của Adele", "open_page", "youtube"),
+            ("thủ đô của Úc là gì", "find_info", ""),
+            ("liệt kê các file trong thư mục Downloads", "use_computer", ""),
+            ("chào bạn", "chat", ""),
+            ("mở bài period của iri trên youtube'", "open_page", "youtube"),
+            ("cho mình xem giá iphone 16 trên thegioididong", "open_page", "thegioididong"),
+            ("xem bản đồ đường đến hồ gươm", "open_page", "google"),
+        ];
+        let mut right = 0;
+        for (question, action, site) in cases {
+            let started = std::time::Instant::now();
+            let intent = tauri::async_runtime::block_on(decide(&runtime, &model_name, thinks, 8192, question, &[])).expect("no decision");
+            let ok = intent.action == action && (site.is_empty() || intent.query(question).to_lowercase().contains(site));
+            right += ok as usize;
+            println!("{question} -> {} {} | query {:?} | {} ms {}", intent.action, intent.kind, intent.query(question), started.elapsed().as_millis(), if ok { "" } else { "<--" });
+        }
+        assert!(right + 1 >= cases.len(), "{right}/{}", cases.len());
+
+        // Follow-ups: the right name must reach the search; new requests must not carry old names.
+        let turns = |user: &str, answer: &str| vec![(user.to_string(), answer.to_string())];
+        let follow = [
+            (turns("ai là tổng thống mỹ", "Tổng thống Mỹ hiện tại là Donald Trump."), "vợ của ông ấy đã mất vào năm nào và ở đâu", Some("trump"), None),
+            (turns("ai là tổng thống mỹ hiện tại", "Tổng thống Mỹ hiện tại là Donald Trump."), "bao nhiêu tuổi rồi", Some("trump"), None),
+            (turns("mở bài hello của adele", "Đã mở Adele - Hello."), "mở bài khác của cô ấy", Some("adele"), None),
+            (turns("tìm giá iphone 16", "iPhone 16 giá khoảng 22 triệu."), "còn bản pro max", Some("iphone"), None),
+            (turns("mở bài let me love you", "Đã tìm thấy DJ Snake - Let Me Love You trên YouTube."), "mở đi", Some("let me love you"), None),
+            (turns("mở bài call me maybe", "Đã mở Carly Rae Jepsen - Call Me Maybe."), "thôi đổi sang bài 2002 đi", Some("2002"), Some("call me")),
+            (turns("hãy giúp tôi mở bài gội đầu của thắng", "Đã mở THẮNG - GỘI ĐẦU ft. Hà Lê trên YouTube."), "vào đọc báo mới hôm nay trên vnexpress", Some("vnexpress"), Some("gội")),
+            (turns("thủ đô của Úc là gì", "Canberra."), "giá vàng hôm nay bao nhiêu", Some("vàng"), Some("canberra")),
+            (vec![("mở bài hello của adele".to_string(), "Đã mở Adele - Hello (Official Music Video).".to_string()), ("mở bài khác của cô ấy".to_string(), "Đã mở Adele Music Playlist.".to_string())], "thôi đổi sang bài 2002 đi", Some("2002"), Some("adele")),
+        ];
+        let mut follow_right = 0;
+        for (history, question, must, must_not) in &follow {
+            let intent = tauri::async_runtime::block_on(decide(&runtime, &model_name, thinks, 8192, question, history)).expect("no decision");
+            let text = format!("{} {}", intent.subject, intent.query(question)).to_lowercase();
+            let ok = must.is_none_or(|m| text.contains(m)) && must_not.is_none_or(|m| !text.contains(m));
+            follow_right += ok as usize;
+            println!("{question} -> {} refers {} | subject {:?} | query {:?} {}", intent.action, intent.refers_to_previous, intent.subject, intent.query(question), if ok { "" } else { "<--" });
+        }
+        assert!(follow_right + 1 >= follow.len(), "{follow_right}/{}", follow.len());
+
+        // Questions after earlier turns stay questions: answered from search, not by opening pages.
+        let opened = turns("mở bài hello của adele", "Đã mở Adele - Hello (Official Music Video).");
+        let president = turns("ai là tổng thống mỹ", "Tổng thống Mỹ hiện tại là Donald Trump.");
+        let asks = [
+            (&president, "vợ của ông ấy đã mất vào năm nào và ở đâu", "find_info"),
+            (&opened, "giá vàng hôm nay bao nhiêu", "find_info"),
+            (&opened, "thủ đô của Úc là gì", "find_info"),
+            (&president, "mở trang wikipedia của ông ấy", "open_page"),
+        ];
+        let mut ask_right = 0;
+        for (history, question, action) in asks {
+            let intent = tauri::async_runtime::block_on(decide(&runtime, &model_name, thinks, 8192, question, history)).expect("no decision");
+            let ok = intent.action == action;
+            ask_right += ok as usize;
+            println!("{question} -> {} | query {:?} {}", intent.action, intent.query(question), if ok { "" } else { "<--" });
+        }
+        assert_eq!(ask_right, asks.len());
+    }
+
+    fn show(steps: &[Value]) {
+        for step in steps {
+            println!("  - [{}] {} -> {}", step["status"].as_str().unwrap_or(""), step["title"].as_str().unwrap_or(""), step["output"].as_str().unwrap_or("").chars().take(120).collect::<String>().replace('\n', " | "));
+        }
+    }
+    /// `cargo test --lib agent_web -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn agent_web() {
+        let (result, answer, steps) = agent_turn("Hãy tìm trên web: thủ đô của nước Úc là thành phố nào? Trả lời một câu và ghi nguồn.", false);
+        show(&steps);
+        println!("result {result:?}\nanswer: {answer}");
+        assert!(steps.iter().any(|s| s["tool"] == "web_search" && s["status"] == "done"));
+        assert!(result.is_ok() && !answer.trim().is_empty());
+    }
+    /// `cargo test --lib agent_current_facts -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn agent_current_facts() {
+        let (result, answer, steps) = agent_turn("check giúp tôi ai là tổng thống mỹ hiện tại", false);
+        show(&steps);
+        println!("result {result:?}
+answer: {answer}");
+        assert_eq!(steps.first().map(|s| s["tool"].clone()), Some(json!("current_time")), "agent turns start by checking the clock");
+        assert!(steps.iter().any(|s| s["tool"] == "web_search"), "a 'current' question must be searched");
+        assert!(result.is_ok());
+    }
+    /// `cargo test --lib agent_terminal -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn agent_terminal() {
+        let (result, answer, steps) = agent_turn("Dùng lệnh terminal để cho tôi biết phiên bản PowerShell trên máy (lệnh $PSVersionTable.PSVersion).", true);
+        show(&steps);
+        println!("result {result:?}\nanswer: {answer}");
+        assert!(steps.iter().any(|s| s["tool"] == "run_command" && s["status"] == "done"));
+        let (_, _, denied) = agent_turn("Chạy lệnh terminal: Get-Date", false);
+        show(&denied);
+        assert!(denied.iter().any(|s| s["tool"] == "run_command" && s["status"] == "denied"));
+    }
+}
+#[cfg(test)]
+mod chat_live_tests {
+    use super::*;
+    /// `cargo test --lib chat_greeting_is_short -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn chat_greeting_is_short() {
+        let mut outputs = Vec::new();
+        for _ in 0..3 {
+            let dir = std::env::temp_dir().join(format!("lim-chat-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let runtime = Runtime::new(crate::storage::Store::open(&dir.join("t.sqlite3")).unwrap()).unwrap();
+            let session = runtime.store.create_session().unwrap().id;
+            let run = Uuid::new_v4().to_string();
+            let (_, mut assistant) = runtime.store.begin(&session, &run, "qwen3.5:2b", "chào cậu").unwrap();
+            let channel: Channel<Value> = Channel::new(|_| Ok(()));
+            let settings = InferenceSettings::default();
+            let (mut sequence, mut content, mut thinking, mut metrics) = (0, String::new(), String::new(), None);
+            let result = tauri::async_runtime::block_on(generate(&runtime, &session, &run, "qwen3.5:2b", "chào cậu", 4096, &settings, &mut assistant, &channel, &mut sequence, &mut content, &mut thinking, &mut metrics));
+            let out = metrics.as_ref().and_then(|m: &crate::storage::ChatMetrics| m.output_tokens).unwrap_or(0);
+            println!("result {result:?} · output {out} · steps {} · answer {:?}", assistant.steps.as_ref().map_or(0, Vec::len), content.chars().take(60).collect::<String>());
+            assert_eq!(result, Ok(false));
+            outputs.push(out);
+            drop(runtime);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        outputs.sort();
+        assert!(outputs[1] < 600, "median output should stay small, got {outputs:?}");
     }
 }

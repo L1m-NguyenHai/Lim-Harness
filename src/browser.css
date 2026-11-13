@@ -1,0 +1,18 @@
+.browser-panel { flex: 1 1 50%; min-width: 300px; max-width: 900px; display: flex; flex-direction: column; min-height: 0; border-left: 1px solid var(--border); background: var(--surface); }
+.browser-tabs { display: flex; align-items: center; gap: 4px; padding: 6px 8px 0; border-bottom: 1px solid var(--border); overflow-x: auto; scrollbar-width: none; }
+.browser-tab { display: flex; align-items: center; max-width: 180px; min-width: 0; border: 1px solid transparent; border-bottom: 0; border-radius: 6px 6px 0 0; color: var(--muted); }
+.browser-tab.active { background: var(--background); border-color: var(--border); color: var(--text); margin-bottom: -1px; }
+.browser-tab-label { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 6px 4px 6px 8px; background: none; border: 0; color: inherit; font-size: 12px; cursor: pointer; }
+.browser-tab-label span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.browser-tab-close { display: grid; place-items: center; padding: 3px; margin-right: 4px; background: none; border: 0; border-radius: 4px; color: inherit; cursor: pointer; }
+.browser-tab-close:hover, .browser-tab-label:hover { color: var(--text); }
+.browser-new { flex-shrink: 0; }
+.browser-hide { margin-left: auto; flex-shrink: 0; }
+.browser-bar { display: flex; align-items: center; gap: 4px; padding: 6px 8px; border-bottom: 1px solid var(--border); background: var(--background); }
+.browser-bar input { flex: 1; min-width: 0; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); padding: 6px 10px; font-size: 12px; }
+.browser-error { padding: 6px 12px; font-size: 12px; color: var(--accent); border-bottom: 1px solid var(--border); }
+.browser-viewport { flex: 1; min-height: 0; position: relative; background: var(--background); display: grid; place-items: center; }
+.browser-viewport p { max-width: 280px; margin: 0; padding: 16px; text-align: center; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.spin { animation: browser-spin 1s linear infinite; }
+@keyframes browser-spin { to { transform: rotate(360deg); } }
+.chat-layout:has(.browser-panel) > .chat-column { min-width: 340px; }
