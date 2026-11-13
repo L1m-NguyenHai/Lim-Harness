@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { AgentSetup, agentSetupMissing } from "./AgentSetup";
 import Logo from "./Logo";
 import Cookbook from "./Cookbook";
 import FloatingWindow from "./FloatingWindow";
@@ -9,6 +10,7 @@ import { InferencePanel } from "./InferencePanel";
 import { ContextMeter } from "./ContextMeter";
 import { ThinkingSteps } from "./ThinkingSteps";
 import { AgentSteps } from "./AgentSteps";
+import { BrowserPanel } from "./BrowserPanel";
 import { thinkingSteps } from "./thinking-steps";
 import { contextUsage } from "./context-usage";
 import type { VaultHit, MemoryRecord, MemorySettings, MemorySnapshot } from "./core";
@@ -38,6 +40,7 @@ import {
   Trash2,
   Play,
   Bot,
+  Globe,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { moduleCatalog, newSession, readState, STORAGE_KEY } from "./state";
@@ -160,6 +163,12 @@ export default function App() {
     try { const size = JSON.parse(localStorage.getItem("lim-inference-preview") || "{}").contextSize; return [4096,8192,16384].includes(size) ? size : 4096; } catch { return 4096; }
   });
   const [inferenceOpen, setInferenceOpen] = useState(() => { try { return localStorage.getItem("lim-inference-open") !== "false"; } catch { return true; } });
+  const [browserOpen, setBrowserOpen] = useState(() => { try { return localStorage.getItem("lim-browser-open") === "true"; } catch { return false; } });
+  useEffect(() => { try { localStorage.setItem("lim-browser-open", String(browserOpen)); } catch { /* preference only */ } }, [browserOpen]);
+  // Chat, browser and run settings don't all fit on a narrow window: show one side panel.
+  const narrow = () => window.innerWidth < 1500;
+  function showBrowser() { if (narrow()) setInferenceOpen(false); setBrowserOpen(true); }
+  useEffect(() => { if (browserOpen && narrow()) setInferenceOpen(false); }, []); // eslint-disable-line react-hooks/exhaustive-deps
   const [inferenceDirty, setInferenceDirty] = useState(false);
   const [inferenceSettings, setInferenceSettings] = useState<InferenceSettings>(() => {
     if (native) return defaultInference;
@@ -482,6 +491,7 @@ export default function App() {
             if (m.id !== previousId) return m;
             const base = { ...m, runId: event.runId, ...(event.message ?? {}) };
             if (event.type === "text_delta") base.text = m.text + (event.delta ?? "");
+            if (event.type === "text_reset") base.text = event.text ?? "";
             if (event.type === "thinking_delta") base.thinking = (m.thinking ?? "") + (event.delta ?? "");
             if (event.type === "agent_step" && event.step) {
               const step = event.step;
@@ -537,8 +547,13 @@ export default function App() {
   }
   // Agent mode is a per-session setting, saved like the other run parameters.
   async function toggleAgent() {
-    try { await saveInference({ ...panelSettings, agentMode: !effective.agentMode }, effective.contextSize); }
-    catch (error) { setRuntimeError(String(error)); }
+    const turningOn = !effective.agentMode;
+    try { await saveInference({ ...panelSettings, agentMode: turningOn }, effective.contextSize); }
+    catch (error) { setRuntimeError(String(error)); return; }
+    // New users: point to the one-click setup when the decision model or SearXNG is missing.
+    if (turningOn && native && await agentSetupMissing()) {
+      setNotice("Agent chạy tốt hơn với model quyết định và SearXNG. Có thể cài bằng một nút trong Cài đặt → Agent.");
+    }
   }
   async function resolveApproval(approvalId: string, allow: boolean) {
     try {
@@ -754,7 +769,8 @@ export default function App() {
             <header className="topbar">
               <span className="session-title">{session.title}</span>
               <div className="runtime-hud" aria-label="Cấu hình model hiện tại"><span className="hud-model" title={state.preferences.model}>{state.preferences.model || "Ollama · chưa chọn model"}</span><span className="hud-temperature">temp={effective.temperature.toFixed(2)}</span><ContextMeter usage={contextUsage(session, draft, effective.contextSize, effective.numPredict, effective.systemPrompt)} memory={Boolean(vaultPath)} autoCompact={effective.autoCompact} onCompact={native && ready && !running[session.id] && state.preferences.model ? compactNow : undefined} /></div>
-              <button className={`icon-button inference-toggle ${inferenceDirty ? "has-draft" : ""}`} aria-label={inferenceDirty ? "Tham số chạy model · có thay đổi chưa áp dụng" : "Tham số chạy model"} title="Tham số chạy model" aria-expanded={inferenceOpen} aria-controls="inference-heading" onClick={() => setInferenceOpen((open) => !open)}><Settings2 size={17} /></button>
+              <button className={`icon-button browser-toggle ${browserOpen ? "on" : ""}`} aria-label="Trình duyệt" title={browserOpen ? "Ẩn trình duyệt" : "Mở trình duyệt bên cạnh"} aria-pressed={browserOpen} onClick={() => (browserOpen ? setBrowserOpen(false) : showBrowser())}><Globe size={17} /></button>
+              <button className={`icon-button inference-toggle ${inferenceDirty ? "has-draft" : ""}`} aria-label={inferenceDirty ? "Tham số chạy model · có thay đổi chưa áp dụng" : "Tham số chạy model"} title="Tham số chạy model" aria-expanded={inferenceOpen} aria-controls="inference-heading" onClick={() => { if (!inferenceOpen && narrow()) setBrowserOpen(false); setInferenceOpen((open) => !open); }}><Settings2 size={17} /></button>
             </header>
           )}
           {storageError && (
@@ -902,7 +918,7 @@ export default function App() {
                     <textarea
                       id="message-input"
                       ref={composer}
-                      placeholder={effective.agentMode ? "Giao việc cho Lim: tra cứu web, xem tệp, chạy lệnh…" : state.preferences.model ? `Nhắn cho ${state.preferences.model}...` : "Nhắn cho Lim..."}
+                      placeholder={effective.agentMode ? "Giao việc cho Lim: mở trang, tra cứu web, xem tệp, chạy lệnh…" : state.preferences.model ? `Nhắn cho ${state.preferences.model}...` : "Nhắn cho Lim..."}
                       value={draft}
                       readOnly={busy}
                       maxLength={20000}
@@ -950,7 +966,7 @@ export default function App() {
                           className={`module-button agent-toggle ${effective.agentMode ? "on" : ""}`}
                           aria-pressed={effective.agentMode}
                           disabled={!ready || Boolean(running[session.id])}
-                          title={effective.agentMode ? "Agent đang bật: Lim có thể tra web, đọc thư mục và (khi bạn cho phép) chạy lệnh, đọc/ghi tệp" : "Bật Agent để Lim dùng công cụ: web, tệp, terminal"}
+                          title={effective.agentMode ? "Agent đang bật: Lim có thể tra web, mở trình duyệt, đọc thư mục và (khi bạn cho phép) bấm/nhập trên trang, chạy lệnh, đọc/ghi tệp" : "Bật Agent để Lim dùng công cụ: web, trình duyệt, tệp, terminal"}
                           onClick={() => void toggleAgent()}
                         >
                           <Bot size={15} />
@@ -1096,6 +1112,7 @@ export default function App() {
                     <p className="settings-status" role="status">{modelError || "Ollama tại 127.0.0.1:11434. Model và hội thoại được lưu bởi lõi desktop."}</p>
                     <div className="field-row"><label htmlFor="context-size">Context</label><select id="context-size" value={effective.contextSize} disabled={!native || !ready} onChange={(e) => void chooseContext(Number(e.target.value))}>{[4096, 8192, 16384, 32768, 65536, 131072].filter((size) => !modelMax || size <= modelMax || size === effective.contextSize).map((size) => <option key={size} value={size}>{size / 1024}K{size === 4096 ? " · tiết kiệm bộ nhớ" : size >= 32768 ? " · cần nhiều RAM/VRAM" : ""}</option>)}</select></div>
                   </section>
+                  <AgentSetup available={native && ready} notify={setNotice} onModelsChanged={() => void refreshModels()} />
                   <section className="settings-section">
                     <h2>Bộ nhớ Obsidian</h2>
                     <div className="vault-controls"><button className="secondary-button" disabled={!native || !ready || memoryBusy || !!vaultPath} onClick={() => void initializeVault()}>{memoryBusy ? "Đang xử lý…" : "Khởi tạo vault mặc định"}</button>{vaultPath && <button className="secondary-button" disabled={!native || !ready || memoryBusy} onClick={() => void openObsidian()}>Mở trong Obsidian</button>}</div>
@@ -1108,6 +1125,7 @@ export default function App() {
               </>
             </FloatingWindow>
           </main>
+          <BrowserPanel open={browserOpen} obscured={Object.values(windows).includes("open")} onOpen={showBrowser} onClose={() => setBrowserOpen(false)} />
           <InferencePanel key={session.id} sessionTitle={session.title} modelMax={modelMax} open={inferenceOpen} settings={panelSettings} contextSize={effective.contextSize} model={state.preferences.model} ready={ready} onDirty={setInferenceDirty} onSave={saveInference} onClose={() => setInferenceOpen(false)} />
           </div>
         </div>

@@ -99,6 +99,113 @@ pub fn start() -> &'static str {
     "started"
 }
 
+/// One install at a time (the button can be pressed again while pip is still running).
+static INSTALLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn on_path(program: &str) -> Option<PathBuf> {
+    let finder = if cfg!(windows) { "where" } else { "which" };
+    let mut cmd = Command::new(finder);
+    cmd.arg(program).stdin(Stdio::null()).stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let out = cmd.output().ok().filter(|o| o.status.success())?;
+    String::from_utf8_lossy(&out.stdout).lines().map(str::trim).find(|l| !l.is_empty()).map(PathBuf::from)
+}
+
+/// A Python the setup script can use: the `py` launcher, or a `python` that is not the
+/// Microsoft Store alias (Store Python redirects venvs under AppData, see the script).
+fn usable_python() -> bool {
+    on_path("py").is_some() || on_path("python").is_some_and(|p| !p.to_string_lossy().contains("WindowsApps"))
+}
+
+/// What the Settings window shows for SearXNG.
+pub fn status() -> serde_json::Value {
+    serde_json::json!({
+        "installed": installed(),
+        "running": listening(),
+        "installing": INSTALLING.load(std::sync::atomic::Ordering::SeqCst),
+        "git": on_path("git").is_some(),
+        "python": usable_python(),
+    })
+}
+
+/// Runs scripts/setup-searxng.ps1 (the same script as the manual setup), streaming its output
+/// as `{"type":"log","line":…}`, then starts SearXNG with the app's lifecycle (not the script's
+/// -Start, whose process would outlive the app). Ends with `done` or `failed`.
+#[tauri::command]
+pub async fn install_searxng(on_event: tauri::ipc::Channel<serde_json::Value>) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    if INSTALLING.swap(true, Ordering::SeqCst) {
+        return Err("SearXNG đang được cài".into());
+    }
+    let result = tauri::async_runtime::spawn_blocking(move || install_blocking(&on_event)).await.map_err(|e| e.to_string()).and_then(|r| r);
+    INSTALLING.store(false, Ordering::SeqCst);
+    result
+}
+
+fn install_blocking(on_event: &tauri::ipc::Channel<serde_json::Value>) -> Result<(), String> {
+    use std::io::{BufRead, BufReader};
+    let send = |value: serde_json::Value| {
+        let _ = on_event.send(value);
+    };
+    let fail = |message: String| {
+        send(serde_json::json!({"type": "failed", "error": message}));
+        Err(message)
+    };
+    if !cfg!(windows) {
+        return fail("Bộ cài tự động hiện chỉ hỗ trợ Windows.".into());
+    }
+    if on_path("git").is_none() {
+        return fail("Chưa có Git. Cài Git for Windows (git-scm.com) rồi bấm cài lại.".into());
+    }
+    if !usable_python() {
+        return fail("Chưa có Python 3.10+ từ python.org (bản Microsoft Store không dùng được). Cài Python rồi bấm cài lại.".into());
+    }
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("scripts").join("setup-searxng.ps1");
+    if !script.exists() {
+        return fail(format!("Không tìm thấy {}", script.display()));
+    }
+    send(serde_json::json!({"type": "log", "line": "Đang tải mã nguồn SearXNG và cài thư viện Python (có thể mất vài phút)…"}));
+    let mut cmd = Command::new("powershell");
+    cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => return fail(format!("Không chạy được PowerShell: {error}")),
+    };
+    // stderr on its own thread so a full pipe cannot block the script.
+    let stderr = child.stderr.take().map(|err| {
+        std::thread::spawn(move || BufReader::new(err).lines().map_while(Result::ok).collect::<Vec<_>>())
+    });
+    if let Some(out) = child.stdout.take() {
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            if !line.trim().is_empty() {
+                send(serde_json::json!({"type": "log", "line": line}));
+            }
+        }
+    }
+    let status = child.wait().map_err(|e| e.to_string())?;
+    let errors = stderr.and_then(|t| t.join().ok()).unwrap_or_default();
+    if !status.success() || !installed() {
+        let tail = errors.iter().rev().filter(|l| !l.trim().is_empty()).take(4).cloned().collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ");
+        return fail(if tail.is_empty() { format!("Script cài đặt dừng với mã {}", status.code().unwrap_or(-1)) } else { tail });
+    }
+    let started = start();
+    send(serde_json::json!({"type": "done", "start": started}));
+    Ok(())
+}
+
 /// Stops the SearXNG this app started or adopted. Called on app exit.
 pub fn stop() {
     let Ok(mut state) = STATE.lock() else { return };

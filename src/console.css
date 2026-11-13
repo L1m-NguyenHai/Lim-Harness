@@ -287,3 +287,4 @@ kbd, code, pre { font-family: var(--font-mono); }
 .agent-step-output[open] > summary { margin-bottom: 6px; }
 @media (prefers-reduced-motion: reduce) { .agent-step.running .agent-step-icon { animation: none; } }
 .message .agent-unverified { margin: 0 0 8px; padding: 7px 10px; border-left: 3px solid var(--ochre); border-radius: 6px; background: var(--ochre-soft); color: var(--ochre); font-size: 13px; line-height: 1.5; }
+.browser-toggle.on { color: var(--accent); background: var(--surface); }

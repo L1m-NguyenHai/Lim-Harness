@@ -82,10 +82,37 @@ Bật **Agent** ở ô soạn tin. Mỗi lượt Agent bắt đầu bằng xem n
 | `list_dir` | Liệt kê thư mục | Không |
 | `read_file` / `write_file` | Đọc / ghi tệp văn bản | **Có** |
 | `run_command` | Chạy lệnh PowerShell (tối đa 60 giây) | **Có** |
+| `browser_open` / `browser_search` | Mở trang (theo URL có trong kết quả, hoặc link số `[i]` trên trang) / tìm Google trong trình duyệt của app | Không |
+| `browser_read` / `browser_scroll` / `browser_back` / `browser_tabs` | Đọc trang, cuộn, quay lại, xem/chuyển/đóng tab | Không |
+| `browser_click` / `browser_type` | Bấm hoặc nhập vào phần tử số `[i]` trên trang | **Có** |
+
+### Model ra quyết định
+
+Mọi quyết định về yêu cầu (nối tiếp hay mới, mở trang / tra cứu / thao tác máy / trò chuyện, cần gì, trang web nào, loại nội dung, câu tìm kiếm, có cần thông tin hiện tại không) do một model nhỏ riêng đưa ra trong một lời gọi có ép dạng JSON (Ollama `format`); trong code không còn quy tắc hay danh sách từ để đoán ý. Mặc định là `granite4:3b` (IBM, Apache 2.0, ~2 GB), chạy trên CPU để luôn nằm cạnh model chat (trên GPU 6 GB, để cả hai trên GPU làm Ollama đổi model mỗi lượt, chậm thêm ~7 s); mỗi lượt tốn thêm ~3–4 s. Cài bằng nút **Cài** trong **Cài đặt → Agent: tra web và ra quyết định** (tải qua Ollama như Cookbook, có tiến độ), hoặc thủ công:
+
+```powershell
+ollama pull granite4:3b
+```
+
+Khi phiên đã có lượt trước, model quyết định làm hai bước: (1) viết lại tin nhắn thành câu tự đủ nghĩa ("vợ của ông ấy…" → "vợ của Donald Trump…"; yêu cầu mới giữ nguyên), app chỉ nhận câu viết lại nếu nó mượn chữ của lượt trước và phần lớn chữ có trong tin nhắn + lượt trước; (2) quyết định trên câu đó mà không xem lượt trước (xem lượt trước thì granite hay coi câu hỏi thường là "mở trang"). Thêm ~1,5 s cho bước (1). Trình duyệt trong app chỉ được đưa cho model khi quyết định là mở trang; câu hỏi được trả lời từ `web_search` (SearXNG) và `fetch_url`.
+
+Đổi model quyết định bằng cài đặt `decision_model` trong cơ sở dữ liệu của app. Chưa cài model quyết định thì model chat tự ra quyết định với cùng mẫu. App vẫn giữ các chốt an toàn: chặn link bịa, dừng khi đã mở đúng trang, nhắc khi model im lặng, trang web và câu tìm phải lấy từ những gì model quyết định được xem, yêu cầu mới không mang tên chỉ có ở lượt trước.
+
+### Trình duyệt trong app
+
+Nút hình quả địa cầu trên thanh trên cùng mở trình duyệt bên cạnh khung chat (tab, quay lại/tiến tới/tải lại, ô địa chỉ hoặc từ khóa). Mỗi tab là một WebView2 thật nằm trong cửa sổ app (`src-tauri/src/browser.rs`), nên trang hiển thị như Edge và đăng nhập được giữ trong hồ sơ của app. Khi Agent mở trang, khung trình duyệt tự hiện. Mỗi thao tác trả cho model nội dung chữ của trang và danh sách phần tử tương tác đánh số `[i]`, model dùng số đó để bấm/nhập. Model nhỏ hay tự đoán URL (ví dụ mã video YouTube) nên `browser_open` / `fetch_url` chỉ chạy với trang chủ của một site, hoặc URL có phần host+đường dẫn và các mã định danh trong query xuất hiện trong lời người dùng hay kết quả công cụ của lượt đó; URL tự đoán bị trả lỗi để model chép lại URL thật hoặc mở link theo số `[i]`. Trình duyệt tạm ẩn khi một cửa sổ (Cookbook, Bộ nhớ, Cài đặt…) đang mở, vì trang native luôn vẽ đè lên giao diện. Tối đa 8 tab.
+
+Khi người dùng nhờ mở một trang, lượt kết thúc ngay khi trang đó đã mở (trang thật, không phải trang tìm kiếm, đúng trang web nếu có) với câu "Đã mở **…**". Nếu hết lượt mà vẫn chưa mở được, hoặc model bịa link từ 2 lần, app tự tìm và mở kết quả tốt nhất, với mọi model.
+
+Chạy thử cả lượt Agent trong app thật (bản debug): đặt `LIM_AGENT_SMOKE` là tệp kết quả, `LIM_AGENT_SMOKE_PROMPTS="câu 1|câu 2"` (cùng một phiên) và tuỳ chọn `LIM_AGENT_MODEL`; app chạy từng câu với trình duyệt và model thật, từ chối mọi thao tác cần duyệt, rồi ghi các bước và câu trả lời vào tệp. Nên đặt thêm `LIM_HARNESS_TEST_DATA` để không ghi vào dữ liệu thật.
+
+Kiểm tra nhanh không cần model (bản debug): đặt `LIM_BROWSER_SMOKE` là đường dẫn tệp kết quả rồi chạy app; app tự mở example.com, tìm Google, mở Wikipedia ở tab mới, cuộn, chuyển tab, bấm phần tử và ghi những gì model sẽ thấy vào tệp đó.
 
 ### Cài SearXNG (khuyến nghị, một lần mỗi máy)
 
 DuckDuckGo/Bing hay chặn truy vấn tự động, nên Agent ưu tiên một SearXNG chạy trên máy (gộp kết quả Google, Brave…; miễn phí, không cần API key). Không cần Docker hay WSL. Cần Git và **Python 3.10+ cài từ python.org** (không dùng bản Microsoft Store vì nó chuyển hướng venv vào AppData).
+
+Cách nhanh: **Cài đặt → Agent: tra web và ra quyết định → SearXNG → Cài**. App kiểm tra Git/Python trước (thiếu thì báo cần cài gì), chạy đúng script bên dưới, hiện từng dòng tiến độ rồi tự bật SearXNG cùng vòng đời app. Khi bật Agent mà máy còn thiếu model quyết định hoặc SearXNG, app hiện gợi ý tới mục này. Cách thủ công:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-searxng.ps1
