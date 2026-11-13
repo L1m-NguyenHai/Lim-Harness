@@ -44,7 +44,7 @@ Mở Ollama tại `127.0.0.1:11434`, tải một model, rồi chạy `npm run ta
 - Hội thoại thật streaming qua Ollama; nút dừng hủy request, giữ phần đã nhận. Có timeout, giới hạn context và xử lý lỗi.
 - SQLite `harness.sqlite3` trong thư mục app data `dev.lim.harness` lưu phiên, tin nhắn và trạng thái lượt. Lượt chưa kết thúc khi đóng app được khôi phục thành interrupted.
 - Dữ liệu phiên cũ trong WebView được chuyển một lần khi kho native rỗng; assistant từ bản UI thử được gắn nguồn riêng và không gửi model. Browser preview và WebView có localStorage riêng.
-- Chọn đường dẫn vault tuyệt đối trong Cài đặt. Adapter chỉ đọc `.md`, tìm từ khóa có giới hạn, đưa trích đoạn có nguồn vào chat; xem và tìm riêng tại Bộ nhớ. Không ghi hoặc sửa vault. Chi tiết: [memory adapter](docs/obsidian-memory.md).
+- Chọn vault trong Cài đặt. Bật **Bộ nhớ cho vault** để tự ghi memory vào `LimMemory/` sau hội thoại; có thêm/sửa/ghim/quên, nguồn/lịch sử và tùy chọn dùng/tự ghi nhớ độc lập. Ghi chú ngoài thư mục này vẫn chỉ đọc. Chi tiết: [Memory v1](docs/memory-v1.md).
 - Context mặc định 4K, chọn được 4K–128K theo mức tối đa model hỗ trợ (đọc từ Ollama). Ngân sách tính theo token ước lượng (~3 byte/token). Khi hội thoại vượt 75% chỗ trống, model tự tóm tắt các lượt cũ (auto-compact); có nút "Thu gọn ngay". Transcript gốc vẫn được giữ.
 - Một giới hạn output dùng chung cho suy nghĩ và trả lời; hết giới hạn thì tin dừng ở trạng thái "đã dừng" với nút **Tiếp tục** (model Qwen suy nghĩ tiếp đúng mạch cũ).
 - Cookbook có tab Active/Launch/Download/Dependencies/Settings và bảng model compact. Đọc cấu hình Windows, gợi ý theo RAM/VRAM, tìm/lọc/sắp xếp catalog và model đã cài. Download tải tag Ollama và báo tiến độ từng layer; Launch nạp/xác nhận trước khi chọn cho chat. Có ngắt yêu cầu và giải phóng model. [Hướng dẫn Cookbook](docs/cookbook.md).
@@ -61,6 +61,8 @@ Mở Ollama tại `127.0.0.1:11434`, tải một model, rồi chạy `npm run ta
 - Agent mode (nút **Agent** ở ô soạn tin): model dùng công cụ tra web, đọc trang, xem thư mục, và — khi bạn bấm **Cho phép** — đọc/ghi tệp, chạy lệnh terminal. Module vẫn là danh mục UI mẫu, chưa được chạy bởi lõi hội thoại.
 
 Đã kiểm tra với `qwen3.5:2b` qua Ollama trên Windows. Model nhỏ có thể trả lời sai hoặc bỏ qua chỉ dẫn; app luôn hiện các bước công cụ và cảnh báo khi câu trả lời chưa có nguồn web.
+
+Memory v1 đã có fixture native với Ollama thật và vault tổng hợp để kiểm tra hàng đợi, ghi Markdown, recall giữa hai phiên và nguồn được lưu. Chưa xác nhận vault cá nhân hoặc CRUD bằng chuột trên desktop; chất lượng extraction/citation phụ thuộc model. Xem giới hạn trong [Memory v1](docs/memory-v1.md).
 
 Thiết kế: `design-system/lim-harness/MASTER.md`. Quy tắc agent: `AGENTS.md`. Tiến độ: [Notion](https://app.notion.com/p/3f7cf6346c8581e0be15fda0adceca12).
 

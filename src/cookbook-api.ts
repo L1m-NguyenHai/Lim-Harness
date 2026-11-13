@@ -32,4 +32,5 @@ export const cookbook = {
   },
   cancel: (operationId: string) => invoke<boolean>("cancel_model_setup", { operationId }),
   unload: (model: string) => invoke<void>("unload_model", { model }),
+  remove: (model: string) => invoke<void>("delete_model", { model }),
 };

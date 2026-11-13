@@ -1173,3 +1173,30 @@ dialog::backdrop {
 .message-sources { margin-top: 10px; font-size: 13px; }
 .message-sources summary { cursor: pointer; }
 .message-sources > div { padding: 10px 0; }
+.markdown-memory { margin: 16px 0 24px; }
+.memory-path, .memory-detail small, .memory-job small { display: block; color: var(--muted); overflow-wrap: anywhere; }
+.memory-preferences { display: grid; gap: 10px; margin: 16px 0; padding: 16px; border: 1px solid var(--border); border-radius: 8px; }
+.memory-preferences label, .memory-archive { display: flex; align-items: center; gap: 8px; }
+.memory-preferences input, .memory-archive input { width: 18px; height: 18px; flex: none; }
+.memory-toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin: 16px 0 8px; }
+.memory-toolbar input { flex: 1; min-width: 160px; }
+.memory-layout { display: grid; grid-template-columns: minmax(170px, 0.85fr) minmax(240px, 1.4fr); gap: 16px; margin-top: 16px; }
+.memory-records { display: grid; gap: 8px; align-content: start; max-height: 500px; overflow-y: auto; }
+.memory-record { text-align: left; padding: 12px; border: 1px solid var(--border); border-radius: 8px; overflow-wrap: anywhere; }
+.memory-record.selected { border-color: var(--accent); background: var(--hover); }
+.memory-record strong, .memory-record span { display: block; }
+.memory-record span { color: var(--muted); font-size: 12px; margin: 4px 0; }
+.memory-record p { font-size: 13px; }
+.memory-detail { min-width: 0; padding: 16px; border: 1px solid var(--border); border-radius: 8px; }
+.memory-detail h2 { font-size: 18px; margin-bottom: 8px; }
+.memory-detail h3 { font-size: 14px; margin-top: 24px; }
+.memory-detail form > label { display: block; margin: 12px 0 6px; }
+.memory-detail form > input, .memory-detail form > textarea, .memory-detail form > select { width: 100%; }
+.memory-content, .memory-history p { white-space: pre-wrap; overflow-wrap: anywhere; margin: 16px 0; }
+.memory-detail blockquote { border-left: 2px solid var(--border); padding-left: 12px; margin: 12px 0; overflow-wrap: anywhere; }
+.memory-history, .memory-job { padding: 12px 0; border-bottom: 1px solid var(--border); }
+.memory-jobs, .memory-diagnostics, .local-notes-section { margin-top: 24px; }
+.memory-jobs summary, .memory-diagnostics summary, .memory-detail summary, .local-notes-section summary { cursor: pointer; padding: 8px 0; }
+.memory-error { margin: 12px 0; padding: 12px; border: 1px solid var(--border); overflow-wrap: anywhere; }
+.local-notes-section > p { color: var(--muted); margin: 8px 0; }
+@media (max-width: 650px) { .memory-layout { grid-template-columns: 1fr; } .memory-records { max-height: 250px; } }
