@@ -1200,3 +1200,15 @@ dialog::backdrop {
 .memory-error { margin: 12px 0; padding: 12px; border: 1px solid var(--border); overflow-wrap: anywhere; }
 .local-notes-section > p { color: var(--muted); margin: 8px 0; }
 @media (max-width: 650px) { .memory-layout { grid-template-columns: 1fr; } .memory-records { max-height: 250px; } }
+
+/* Agent setup (Settings → Agent): one row per component, with state and an install button. */
+.setup-row { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-top: 1px solid var(--border); }
+.setup-row > div { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.setup-row strong { font-size: 13px; font-weight: 500; }
+.setup-row small, .setup-detail small { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.setup-state { font-size: 12px; color: var(--ochre); white-space: nowrap; }
+.setup-state.ok { color: var(--success); }
+.setup-detail { margin: -4px 0 8px; display: flex; flex-direction: column; gap: 4px; }
+.setup-detail progress { width: 100%; height: 5px; accent-color: var(--accent); }
+.agent-setup > .secondary-button { margin-top: 8px; }
+@media (max-width: 520px) { .setup-row { flex-wrap: wrap; } }

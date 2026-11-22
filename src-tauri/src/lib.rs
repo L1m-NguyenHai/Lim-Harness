@@ -1,8 +1,11 @@
+mod agent;
+mod browser;
 mod catalog;
 mod cookbook;
 mod memory;
 mod memory_runtime;
 mod runtime;
+mod searxng;
 mod storage;
 mod vault;
 mod vault_setup;
@@ -13,6 +16,11 @@ use tauri::Manager;
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
+            browser::init(app.handle().clone());
+            #[cfg(debug_assertions)]
+            if let Some(path) = std::env::var_os("LIM_BROWSER_SMOKE") {
+                browser::smoke(path.into());
+            }
             let directory = app.path().app_data_dir()?;
             // Debug smoke tests use a separate database without changing the user's app data.
             #[cfg(debug_assertions)]
@@ -35,8 +43,14 @@ pub fn run() {
             let runtime = runtime::Runtime::new(store).map_err(std::io::Error::other)?;
             let runtime = Arc::new(runtime);
             memory_runtime::start_worker(Arc::clone(&runtime));
+            #[cfg(debug_assertions)]
+            if let Some(path) = std::env::var_os("LIM_AGENT_SMOKE") {
+                runtime::agent_smoke(Arc::clone(&runtime), path.into());
+            }
             app.manage(runtime);
             app.manage(Arc::new(cookbook::Cookbook::new()));
+            // Local SearXNG for agent web search lives as long as the app (see searxng.rs).
+            std::thread::spawn(searxng::start);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -59,8 +73,11 @@ pub fn run() {
             memory_runtime::read_memory,
             memory_runtime::retry_memory_job,
             runtime::list_models,
+            runtime::agent_setup_status,
+            searxng::install_searxng,
             runtime::start_turn,
             runtime::continue_turn,
+            runtime::resolve_approval,
             runtime::compact_session,
             runtime::model_context,
             runtime::cancel_turn,
@@ -70,8 +87,20 @@ pub fn run() {
             cookbook::unload_model,
             cookbook::delete_model,
             catalog::get_model_catalog,
-            catalog::search_model_catalog
+            catalog::search_model_catalog,
+            browser::browser_state,
+            browser::browser_set_bounds,
+            browser::browser_open,
+            browser::browser_nav,
+            browser::browser_select,
+            browser::browser_close,
+            browser::browser_focus_main
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run Lim Harness");
+        .build(tauri::generate_context!())
+        .expect("failed to build Lim Harness")
+        .run(|_app, event| {
+            if let tauri::RunEvent::Exit = event {
+                searxng::stop();
+            }
+        });
 }

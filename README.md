@@ -14,6 +14,8 @@ Script kiểm tra môi trường, cài dependency từ lockfile khi cần, rồi
 
 Chi tiết công cụ cần cài, Git push lần đầu và cách cùng làm: [Hướng dẫn setup](docs/getting-started.md). Ollama/model/vault được cấu hình riêng trên mỗi máy; không cần Odysseus để chạy Lim.
 
+Muốn Agent tra cứu web ổn định, cài thêm SearXNG cục bộ (một lần mỗi máy): xem [Agent mode và tìm web (SearXNG)](#agent-mode-và-tìm-web-searxng).
+
 ## Chạy frontend
 
 ```sh
@@ -23,7 +25,7 @@ npm run dev
 
 Mở http://localhost:1420. `npm run build` kiểm tra TypeScript và build frontend. Node 22.18+ hoặc 24 chạy `npm run test:state` để kiểm tra đọc dữ liệu lưu, ngày không hợp lệ và lỗi localStorage.
 
-`npm run test:colors` kiểm tra contrast chữ của các token sáng/tối. UI dùng font hệ thống, không tải font từ mạng.
+`npm run test:colors` kiểm tra contrast chữ của các token sáng/tối; `npm run test:context` kiểm tra cách tính context; `npm run test:thinking` kiểm tra bộ tách các bước suy nghĩ. Font Geist được đóng gói kèm app, không tải font từ mạng.
 
 ## Chạy cửa sổ Tauri
 
@@ -43,7 +45,8 @@ Mở Ollama tại `127.0.0.1:11434`, tải một model, rồi chạy `npm run ta
 - SQLite `harness.sqlite3` trong thư mục app data `dev.lim.harness` lưu phiên, tin nhắn và trạng thái lượt. Lượt chưa kết thúc khi đóng app được khôi phục thành interrupted.
 - Dữ liệu phiên cũ trong WebView được chuyển một lần khi kho native rỗng; assistant từ bản UI thử được gắn nguồn riêng và không gửi model. Browser preview và WebView có localStorage riêng.
 - Chọn vault trong Cài đặt. Bật **Bộ nhớ cho vault** để tự ghi memory vào `LimMemory/` sau hội thoại; có thêm/sửa/ghim/quên, nguồn/lịch sử và tùy chọn dùng/tự ghi nhớ độc lập. Ghi chú ngoài thư mục này vẫn chỉ đọc. Chi tiết: [Memory v1](docs/memory-v1.md).
-- Context mặc định 4K, có thể chọn 8K/16K. Budget UTF-8 bảo thủ có thể yêu cầu rút gọn prompt; transcript gốc vẫn được giữ.
+- Context mặc định 4K, chọn được 4K–128K theo mức tối đa model hỗ trợ (đọc từ Ollama). Ngân sách tính theo token ước lượng (~3 byte/token). Khi hội thoại vượt 75% chỗ trống, model tự tóm tắt các lượt cũ (auto-compact); có nút "Thu gọn ngay". Transcript gốc vẫn được giữ.
+- Một giới hạn output dùng chung cho suy nghĩ và trả lời; hết giới hạn thì tin dừng ở trạng thái "đã dừng" với nút **Tiếp tục** (model Qwen suy nghĩ tiếp đúng mạch cũ).
 - Cookbook có tab Active/Launch/Download/Dependencies/Settings và bảng model compact. Đọc cấu hình Windows, gợi ý theo RAM/VRAM, tìm/lọc/sắp xếp catalog và model đã cài. Download tải tag Ollama và báo tiến độ từng layer; Launch nạp/xác nhận trước khi chọn cho chat. Có ngắt yêu cầu và giải phóng model. [Hướng dẫn Cookbook](docs/cookbook.md).
 - Catalog kèm app có 67 tag từ 20 family, metadata registry đã xác minh và cache/cập nhật online. Bảng đánh giá Auto/RAM/GPU, FIT SCORE phù hợp bộ nhớ và SPEED quan sát từ lượt chat khi có dữ liệu. [Nguồn và công thức](docs/model-catalog.md). `npm run catalog:refresh` thu thập snapshot metadata mới, không tải weights.
 
@@ -55,7 +58,9 @@ Mở Ollama tại `127.0.0.1:11434`, tải một model, rồi chạy `npm run ta
 - Cookbook, Bộ nhớ, Module và Cài đặt mở thành cửa sổ nổi trong app: kéo, đổi kích thước, thu gọn về dock và phóng to/khôi phục. Chat là vùng chính; chọn Hội thoại thu gọn các cửa sổ đang mở. Đóng cửa sổ không hủy công việc nền.
 - Logo hình học riêng dùng trong UI, favicon và icon Tauri; vector gốc tại `public/logo.svg` và `public/app-icon.svg`.
 - Ghi chú cục bộ và tùy chọn giao diện dùng localStorage; hội thoại native có SQLite làm nguồn chính.
-- Chưa có module executor hoặc agent tool loop. Module là danh mục UI mẫu, không được chạy bởi lõi hội thoại.
+- Agent mode (nút **Agent** ở ô soạn tin): model dùng công cụ tra web, đọc trang, xem thư mục, và — khi bạn bấm **Cho phép** — đọc/ghi tệp, chạy lệnh terminal. Module vẫn là danh mục UI mẫu, chưa được chạy bởi lõi hội thoại.
+
+Đã kiểm tra với `qwen3.5:2b` qua Ollama trên Windows. Model nhỏ có thể trả lời sai hoặc bỏ qua chỉ dẫn; app luôn hiện các bước công cụ và cảnh báo khi câu trả lời chưa có nguồn web.
 
 Memory v1 đã có fixture native với Ollama thật và vault tổng hợp để kiểm tra hàng đợi, ghi Markdown, recall giữa hai phiên và nguồn được lưu. Chưa xác nhận vault cá nhân hoặc CRUD bằng chuột trên desktop; chất lượng extraction/citation phụ thuộc model. Xem giới hạn trong [Memory v1](docs/memory-v1.md).
 
@@ -63,4 +68,98 @@ Thiết kế: `design-system/lim-harness/MASTER.md`. Quy tắc agent: `AGENTS.md
 
 ## Tham số chạy model
 
-Chat có panel inference + system prompt bên phải, ẩn/mở từ thanh tiêu đề. Nhấn **Áp dụng** để lưu cấu hình dùng chung vào SQLite; lượt đang chạy giữ cấu hình lúc gửi. Context được lưu cùng lần Áp dụng, dùng chung với Cookbook. Xem `docs/inference-panel.md` cho phạm vi tham số và ngân sách context.
+Chat có panel inference + system prompt bên phải, ẩn/mở từ thanh tiêu đề. Mọi thông số (context, temperature, top P/K, repeat penalty, seed, system prompt, giới hạn output, tự thu gọn, Agent) lưu **riêng cho từng phiên** trong SQLite khi nhấn **Áp dụng**; phiên mới bắt đầu từ mặc định. Lượt đang chạy giữ cấu hình lúc gửi. Xem `docs/inference-panel.md` cho phạm vi tham số và ngân sách context.
+
+## Agent mode và tìm web (SearXNG)
+
+Bật **Agent** ở ô soạn tin. Mỗi lượt Agent bắt đầu bằng xem ngày giờ trên máy; câu hỏi về "hiện tại / mới nhất / hôm nay…" được tìm web kèm năm hiện tại trước khi trả lời.
+
+| Công cụ | Việc làm | Cần bạn cho phép |
+|---|---|---|
+| `current_time` | Ngày giờ trên máy | Không |
+| `web_search` | Tìm web (SearXNG → DuckDuckGo → Bing) | Không |
+| `fetch_url` | Đọc nội dung trang http/https | Không |
+| `list_dir` | Liệt kê thư mục | Không |
+| `read_file` / `write_file` | Đọc / ghi tệp văn bản | **Có** |
+| `run_command` | Chạy lệnh PowerShell (tối đa 60 giây) | **Có** |
+| `browser_open` / `browser_search` | Mở trang (theo URL có trong kết quả, hoặc link số `[i]` trên trang) / tìm Google trong trình duyệt của app | Không |
+| `browser_read` / `browser_scroll` / `browser_back` / `browser_tabs` | Đọc trang, cuộn, quay lại, xem/chuyển/đóng tab | Không |
+| `browser_click` / `browser_type` | Bấm hoặc nhập vào phần tử số `[i]` trên trang | **Có** |
+
+### Model ra quyết định
+
+Mọi quyết định về yêu cầu (nối tiếp hay mới, mở trang / tra cứu / thao tác máy / trò chuyện, cần gì, trang web nào, loại nội dung, câu tìm kiếm, có cần thông tin hiện tại không) do một model nhỏ riêng đưa ra trong một lời gọi có ép dạng JSON (Ollama `format`); trong code không còn quy tắc hay danh sách từ để đoán ý. Mặc định là `granite4:3b` (IBM, Apache 2.0, ~2 GB), chạy trên CPU để luôn nằm cạnh model chat (trên GPU 6 GB, để cả hai trên GPU làm Ollama đổi model mỗi lượt, chậm thêm ~7 s); mỗi lượt tốn thêm ~3–4 s. Cài bằng nút **Cài** trong **Cài đặt → Agent: tra web và ra quyết định** (tải qua Ollama như Cookbook, có tiến độ), hoặc thủ công:
+
+```powershell
+ollama pull granite4:3b
+```
+
+Khi phiên đã có lượt trước, model quyết định làm hai bước: (1) viết lại tin nhắn thành câu tự đủ nghĩa ("vợ của ông ấy…" → "vợ của Donald Trump…"; yêu cầu mới giữ nguyên), app chỉ nhận câu viết lại nếu nó mượn chữ của lượt trước và phần lớn chữ có trong tin nhắn + lượt trước; (2) quyết định trên câu đó mà không xem lượt trước (xem lượt trước thì granite hay coi câu hỏi thường là "mở trang"). Thêm ~1,5 s cho bước (1). Trình duyệt trong app chỉ được đưa cho model khi quyết định là mở trang; câu hỏi được trả lời từ `web_search` (SearXNG) và `fetch_url`.
+
+Đổi model quyết định bằng cài đặt `decision_model` trong cơ sở dữ liệu của app. Chưa cài model quyết định thì model chat tự ra quyết định với cùng mẫu. App vẫn giữ các chốt an toàn: chặn link bịa, dừng khi đã mở đúng trang, nhắc khi model im lặng, trang web và câu tìm phải lấy từ những gì model quyết định được xem, yêu cầu mới không mang tên chỉ có ở lượt trước.
+
+### Trình duyệt trong app
+
+Nút hình quả địa cầu trên thanh trên cùng mở trình duyệt bên cạnh khung chat (tab, quay lại/tiến tới/tải lại, ô địa chỉ hoặc từ khóa). Mỗi tab là một WebView2 thật nằm trong cửa sổ app (`src-tauri/src/browser.rs`), nên trang hiển thị như Edge và đăng nhập được giữ trong hồ sơ của app. Khi Agent mở trang, khung trình duyệt tự hiện. Mỗi thao tác trả cho model nội dung chữ của trang và danh sách phần tử tương tác đánh số `[i]`, model dùng số đó để bấm/nhập. Model nhỏ hay tự đoán URL (ví dụ mã video YouTube) nên `browser_open` / `fetch_url` chỉ chạy với trang chủ của một site, hoặc URL có phần host+đường dẫn và các mã định danh trong query xuất hiện trong lời người dùng hay kết quả công cụ của lượt đó; URL tự đoán bị trả lỗi để model chép lại URL thật hoặc mở link theo số `[i]`. Trình duyệt tạm ẩn khi một cửa sổ (Cookbook, Bộ nhớ, Cài đặt…) đang mở, vì trang native luôn vẽ đè lên giao diện. Tối đa 8 tab.
+
+Khi người dùng nhờ mở một trang, lượt kết thúc ngay khi trang đó đã mở (trang thật, không phải trang tìm kiếm, đúng trang web nếu có) với câu "Đã mở **…**". Nếu hết lượt mà vẫn chưa mở được, hoặc model bịa link từ 2 lần, app tự tìm và mở kết quả tốt nhất, với mọi model.
+
+Chạy thử cả lượt Agent trong app thật (bản debug): đặt `LIM_AGENT_SMOKE` là tệp kết quả, `LIM_AGENT_SMOKE_PROMPTS="câu 1|câu 2"` (cùng một phiên) và tuỳ chọn `LIM_AGENT_MODEL`; app chạy từng câu với trình duyệt và model thật, từ chối mọi thao tác cần duyệt, rồi ghi các bước và câu trả lời vào tệp. Nên đặt thêm `LIM_HARNESS_TEST_DATA` để không ghi vào dữ liệu thật.
+
+Kiểm tra nhanh không cần model (bản debug): đặt `LIM_BROWSER_SMOKE` là đường dẫn tệp kết quả rồi chạy app; app tự mở example.com, tìm Google, mở Wikipedia ở tab mới, cuộn, chuyển tab, bấm phần tử và ghi những gì model sẽ thấy vào tệp đó.
+
+### Cài SearXNG (khuyến nghị, một lần mỗi máy)
+
+DuckDuckGo/Bing hay chặn truy vấn tự động, nên Agent ưu tiên một SearXNG chạy trên máy (gộp kết quả Google, Brave…; miễn phí, không cần API key). Không cần Docker hay WSL. Cần Git và **Python 3.10+ cài từ python.org** (không dùng bản Microsoft Store vì nó chuyển hướng venv vào AppData).
+
+Cách nhanh: **Cài đặt → Agent: tra web và ra quyết định → SearXNG → Cài**. App kiểm tra Git/Python trước (thiếu thì báo cần cài gì), chạy đúng script bên dưới, hiện từng dòng tiến độ rồi tự bật SearXNG cùng vòng đời app. Khi bật Agent mà máy còn thiếu model quyết định hoặc SearXNG, app hiện gợi ý tới mục này. Cách thủ công:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-searxng.ps1
+```
+
+Script tải mã nguồn chính thức `searxng/searxng`, tạo venv và cài thư viện trong `.local/` (đã gitignore):
+
+- `.local/searxng-src/` — mã nguồn SearXNG (chỉ phần cần để chạy).
+- `.local/searxng-venv/` — môi trường Python riêng.
+- `.local/searxng-settings.yml` — chỉ nghe `127.0.0.1:8888`, bật JSON, tắt limiter, khóa bí mật ngẫu nhiên (không commit).
+
+Chạy lại script để cập nhật SearXNG; file settings đã có được giữ nguyên. Thêm `-Start` để bật ngay sau khi cài (bản bật tay này không bị app tắt).
+
+### Vòng đời
+
+- **Mở app → SearXNG tự bật** (nếu đã cài). Nếu cổng 8888 đã có SearXNG khác, app chỉ dùng, không quản lý.
+- **Đóng app → SearXNG tự tắt**, kể cả khi app bị dừng đột ngột: các tiến trình nằm trong Job Object của Windows và kết thúc cùng app.
+- Chưa cài SearXNG: Agent vẫn tìm qua DuckDuckGo/Bing; khi không có nguồn, câu trả lời có cảnh báo "Chưa lấy được nguồn web nào…".
+- Dùng SearXNG ở địa chỉ khác: đặt biến môi trường `LIM_SEARXNG_URL` (ví dụ `http://192.168.1.10:8080`) trước khi mở app; instance đó cần bật `formats: [html, json]`.
+
+### Kiểm tra SearXNG có chạy
+
+Trong Windows PowerShell, `curl` là tên gọi tắt của `Invoke-WebRequest`, nên dùng một trong hai lệnh (kết quả `200` = đang chạy):
+
+```powershell
+curl.exe -s -o NUL -w "%{http_code}\n" http://127.0.0.1:8888/healthz
+```
+
+```powershell
+try { (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8888/healthz -TimeoutSec 3).StatusCode } catch { "SearXNG không chạy" }
+```
+
+Thử tìm kiếm qua API JSON mà app dùng:
+
+```powershell
+(Invoke-RestMethod "http://127.0.0.1:8888/search?q=thu+do+nuoc+Uc&format=json" -Headers @{ "X-Real-IP" = "127.0.0.1" }).results | Select-Object -First 3 title, url
+```
+
+SearXNG chỉ chạy khi app đang mở; đóng app rồi kiểm tra thì "không chạy" là đúng.
+
+### Xử lý sự cố
+
+| Hiện tượng | Cách xử lý |
+|---|---|
+| Script báo không tìm thấy `py`/`python` | Cài Python 3.10+ từ python.org, mở terminal mới rồi chạy lại |
+| App mở nhưng `/healthz` không trả `200` | Kiểm tra `.local/searxng-venv/Scripts/python.exe` có tồn tại; chạy lại script cài |
+| Cổng 8888 bị chương trình khác chiếm | Tắt chương trình đó, hoặc chạy SearXNG ở cổng khác và đặt `LIM_SEARXNG_URL` |
+| Chạy tay để xem log lỗi (đóng app trước) | Từ thư mục dự án: `cd .local\searxng-src; $env:SEARXNG_SETTINGS_PATH = (Resolve-Path ..\searxng-settings.yml).Path; ..\searxng-venv\Scripts\python.exe -m searx.webapp` |
+
+Ghi chú: SearXNG không hỗ trợ Windows chính thức; script xử lý hai điểm riêng của Windows (bỏ vài tệp mẫu Linux có `:` trong tên, thêm module `pwd` thay thế trong venv). Nếu sau này dùng Docker, chạy image `searxng/searxng` ở cổng 8888 — app không cần đổi gì.

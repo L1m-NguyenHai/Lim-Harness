@@ -24,3 +24,6 @@ vault/
 vaults/
 models/
 docs/notion-pending.md
+
+# Local tools installed by scripts/setup-searxng.ps1 (SearXNG source, venv, settings with secret)
+.local/

@@ -7,6 +7,7 @@
 - Với desktop/build: Rust dùng toolchain **Windows MSVC**, Microsoft Visual Studio Build Tools với workload **Desktop development with C++**, Windows 10/11 SDK.
 - Microsoft Edge WebView2 Evergreen Runtime để mở cửa sổ desktop.
 - Ollama chỉ cần khi chạy inference, không cần để build hoặc xem frontend. Mỗi máy tự tải model và tự chọn vault Obsidian.
+- Python 3.10+ từ python.org (không dùng bản Microsoft Store) nếu muốn Agent tra web qua SearXNG cục bộ. Không cần Docker hay WSL.
 
 Nguồn cài đặt: [Node.js](https://nodejs.org/), [Git](https://git-scm.com/downloads/win), [Rust](https://rustup.rs/), [Tauri Windows prerequisites](https://v2.tauri.app/start/prerequisites/#windows), [Ollama](https://ollama.com/download/windows). Sau khi cài công cụ, mở terminal mới để nhận PATH.
 
@@ -21,6 +22,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1
 Thay URL bằng repo thật. `ExecutionPolicy Bypass` chỉ áp dụng cho tiến trình chạy lệnh này, không đổi policy của máy.
 
 Script kiểm tra môi trường, chạy `npm ci` theo lockfile khi cần, rồi mở Tauri dev. Lần đầu Rust sẽ tải/biên dịch dependency nên có thể mất thời gian. Không tự cài công cụ hệ thống, không tạo Git repo, không thay remote, không sửa Odysseus/vault, không tải hoặc nạp model.
+
+Tùy chọn — tìm web cho Agent mode (một lần mỗi máy; SearXNG nằm trong `.local/`, không đi theo Git):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-searxng.ps1
+```
+
+App tự bật SearXNG khi mở và tự tắt khi đóng. Cách kiểm tra và xử lý sự cố: [README — Agent mode và tìm web](../README.md#agent-mode-và-tìm-web-searxng).
 
 ### Các chế độ
 

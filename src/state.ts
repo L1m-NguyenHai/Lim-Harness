@@ -11,6 +11,16 @@ export type ChatMetrics = {
   /** Output limit granted so far; grows by one run's limit on each "Tiếp tục". */
   outputLimit?: number;
 };
+/** One tool call made in agent mode, with the user's approval state for risky tools. */
+export type AgentStep = {
+  id: string;
+  tool: string;
+  title: string;
+  args?: Record<string, string>;
+  status: "waiting" | "running" | "done" | "denied" | "error";
+  output?: string;
+  approvalId?: string;
+};
 export type Message = {
   id: string;
   role: "user" | "assistant";
@@ -24,6 +34,7 @@ export type Message = {
   thinking?: string;
   metrics?: ChatMetrics;
   error?: string;
+  steps?: AgentStep[];
 };
 /** All run settings of one session: context window plus every inference parameter. */
 export type SessionConfig = import("./core").InferenceSettings & { contextSize: number };
